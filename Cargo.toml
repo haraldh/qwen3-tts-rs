@@ -51,6 +51,7 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 rayon = "1.10"             # Parallel CPU processing
+half = "2.7"               # bf16 type for ROCm/CUDA mixed precision
 byteorder = "1.5"
 num-traits = "0.2"
 num-complex = "0.4"
@@ -104,3 +105,7 @@ opt-level = 3
 inherits = "release"
 debug = true
 lto = false
+
+# Override cubecl-hip-sys to use local version with HIP 7.2 support
+[patch.crates-io]
+cubecl-hip-sys = { path = "/home/harald/git/cubecl-hip-sys/crates/cubecl-hip-sys" }

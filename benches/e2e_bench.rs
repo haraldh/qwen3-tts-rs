@@ -24,7 +24,7 @@ use std::time::Instant;
 type B = burn::backend::Cuda;
 
 #[cfg(all(feature = "rocm", not(feature = "cuda")))]
-type B = burn::backend::Rocm;
+type B = burn::backend::Rocm<half::bf16>;
 
 #[cfg(all(feature = "wgpu", not(feature = "cuda"), not(feature = "rocm")))]
 type B = burn::backend::Wgpu;
