@@ -8,25 +8,30 @@ use burn::prelude::*;
 
 use super::kv_cache::KVCache;
 
-/// Create a causal attention mask.
+/// Create a causal attention mask as a boolean tensor.
 ///
-/// Returns a `[1, 1, seq_len, offset + seq_len]` float tensor where position `(i, j)`
-/// is `0.0` if `j <= offset + i` (allowed) and `-inf` (masked).
+/// Returns a `[1, 1, seq_len, offset + seq_len]` Bool tensor where position `(i, j)`
+/// is `true` if `j > offset + i` (masked) and `false` (allowed).
+///
+/// Compatible with [`burn::tensor::module::attention`] which expects `true` = masked.
 pub fn create_causal_mask<B: Backend>(
     seq_len: usize,
     offset: usize,
     device: &B::Device,
-) -> Tensor<B, 4> {
+) -> Tensor<B, 4, Bool> {
     let total_len = offset + seq_len;
-    let mut mask_data = vec![0.0f32; seq_len * total_len];
-    for i in 0..seq_len {
-        for j in 0..total_len {
-            if j > offset + i {
-                mask_data[i * total_len + j] = f32::NEG_INFINITY;
-            }
-        }
-    }
-    Tensor::<B, 1>::from_floats(mask_data.as_slice(), device).reshape([1, 1, seq_len, total_len])
+
+    // Row indices [offset, offset+1, ..., offset+seq_len-1] as [1,1,seq_len,1]
+    let rows: Vec<f32> = (0..seq_len).map(|i| (i + offset) as f32).collect();
+    let rows = Tensor::<B, 1>::from_floats(rows.as_slice(), device).reshape([1, 1, seq_len, 1]);
+
+    // Col indices [0, 1, ..., total_len-1] as [1,1,1,total_len]
+    let cols: Vec<f32> = (0..total_len).map(|j| j as f32).collect();
+    let cols =
+        Tensor::<B, 1>::from_floats(cols.as_slice(), device).reshape([1, 1, 1, total_len]);
+
+    // mask[i][j] = col > row  =>  true means "masked"
+    cols.greater(rows)
 }
 
 /// Apply RoPE rotation to a tensor.
@@ -181,6 +186,9 @@ pub struct AttentionConfig {
 }
 
 /// Multi-head attention with grouped-query attention and QK normalization.
+///
+/// Uses [`burn::tensor::module::attention`] for scaled dot-product attention,
+/// which the CubeCL backend (ROCm/CUDA) overrides with a flash attention kernel.
 #[derive(Module, Debug)]
 pub struct Attention<B: Backend> {
     pub(crate) q_proj: Linear<B>,
@@ -192,7 +200,6 @@ pub struct Attention<B: Backend> {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    scale: f64,
 }
 
 impl AttentionConfig {
@@ -227,7 +234,6 @@ impl AttentionConfig {
             num_heads: self.num_heads,
             num_kv_heads: self.num_kv_heads,
             head_dim: self.head_dim,
-            scale: 1.0 / (self.head_dim as f64).sqrt(),
         }
     }
 }
@@ -237,7 +243,7 @@ impl<B: Backend> Attention<B> {
         &self,
         hidden_states: Tensor<B, 3>,
         rope: &RoPEType<B>,
-        attention_mask: Option<Tensor<B, 4>>,
+        is_causal: bool,
         kv_cache: Option<&mut KVCache<B>>,
         offset: usize,
     ) -> Tensor<B, 3> {
@@ -276,17 +282,14 @@ impl<B: Backend> Attention<B> {
         let k = self.repeat_kv(k);
         let v = self.repeat_kv(v);
 
-        // Scaled dot-product attention
-        let attn_weights = q.matmul(k.swap_dims(2, 3)) * self.scale;
-
-        let attn_weights = if let Some(mask) = attention_mask {
-            attn_weights + mask
-        } else {
-            attn_weights
+        // Scaled dot-product attention (flash attention on CubeCL backends).
+        // The `is_causal` flag tells the backend to apply causal masking internally,
+        // which is more efficient than passing an explicit bool mask.
+        let options = burn::tensor::ops::AttentionModuleOptions {
+            is_causal,
+            ..Default::default()
         };
-
-        let attn_weights = burn::tensor::activation::softmax(attn_weights, 3);
-        let attn_output = attn_weights.matmul(v);
+        let attn_output = burn::tensor::module::attention(q, k, v, None, None, options);
 
         // Reshape back: [batch, heads, seq, head_dim] -> [batch, seq, hidden]
         let attn_output =
@@ -398,7 +401,7 @@ impl<B: Backend> DecoderLayer<B> {
         &self,
         hidden_states: Tensor<B, 3>,
         rope: &RoPEType<B>,
-        attention_mask: Option<Tensor<B, 4>>,
+        is_causal: bool,
         kv_cache: Option<&mut KVCache<B>>,
         offset: usize,
     ) -> Tensor<B, 3> {
@@ -407,7 +410,7 @@ impl<B: Backend> DecoderLayer<B> {
         let normed = self.input_layernorm.forward(hidden_states);
         let attn_output = self
             .self_attn
-            .forward(normed, rope, attention_mask, kv_cache, offset);
+            .forward(normed, rope, is_causal, kv_cache, offset);
         let hidden_states = residual + attn_output;
 
         // MLP with residual
@@ -464,6 +467,15 @@ mod tests {
         let device = Default::default();
         let mask = create_causal_mask::<B>(3, 0, &device);
         assert_eq!(mask.dims(), [1, 1, 3, 3]);
+        // Verify mask values: true = masked (future positions)
+        let data: Vec<bool> = mask.reshape([9]).into_data().to_vec().unwrap();
+        // Row 0: [false, true, true]   (pos 0 can only see pos 0)
+        // Row 1: [false, false, true]  (pos 1 can see 0,1)
+        // Row 2: [false, false, false] (pos 2 can see all)
+        assert_eq!(
+            data,
+            vec![false, true, true, false, false, true, false, false, false]
+        );
     }
 
     #[test]
@@ -482,7 +494,7 @@ mod tests {
         let rope = RoPEType::Standard(RotaryEmbedding::new(16, 512, 10000.0, &device));
 
         let input = Tensor::<B, 3>::zeros([1, 10, 64], &device);
-        let output = attn.forward(input, &rope, None, None, 0);
+        let output = attn.forward(input, &rope, true, None, 0);
         assert_eq!(output.dims(), [1, 10, 64]);
     }
 
@@ -494,10 +506,10 @@ mod tests {
         let mut cache = KVCache::new(1, 2, 64, 16, &device);
 
         let input1 = Tensor::<B, 3>::zeros([1, 5, 64], &device);
-        let _out1 = attn.forward(input1, &rope, None, Some(&mut cache), 0);
+        let _out1 = attn.forward(input1, &rope, true, Some(&mut cache), 0);
 
         let input2 = Tensor::<B, 3>::zeros([1, 3, 64], &device);
-        let out2 = attn.forward(input2, &rope, None, Some(&mut cache), 5);
+        let out2 = attn.forward(input2, &rope, false, Some(&mut cache), 5);
         assert_eq!(out2.dims(), [1, 3, 64]);
     }
 
@@ -509,7 +521,7 @@ mod tests {
         let mut cache = KVCache::new(1, 2, 64, 16, &device);
 
         let input = Tensor::<B, 3>::zeros([1, 8, 64], &device);
-        let output = layer.forward(input, &rope, None, Some(&mut cache), 0);
+        let output = layer.forward(input, &rope, true, Some(&mut cache), 0);
         assert_eq!(output.dims(), [1, 8, 64]);
     }
 

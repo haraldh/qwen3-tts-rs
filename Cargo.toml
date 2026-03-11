@@ -30,7 +30,7 @@ profiling = ["dep:tracing-chrome"]
 
 [dependencies]
 # Burn ML framework (replaces Candle)
-burn = { version = "0.20", default-features = false }
+burn = { path = "/home/harald/git/burn/crates/burn", default-features = false }
 safetensors = "0.4"
 
 # Tokenization (HuggingFace tokenizers in Rust)
@@ -105,6 +105,6 @@ inherits = "release"
 debug = true
 lto = false
 
-# Override cubecl-hip-sys to use local version with HIP 7.2 support
+# Override cubecl-hip-sys for HIP 7.2 support (cubecl is resolved via local burn's workspace)
 [patch.crates-io]
 cubecl-hip-sys = { path = "/home/harald/git/cubecl-hip-sys/crates/cubecl-hip-sys" }

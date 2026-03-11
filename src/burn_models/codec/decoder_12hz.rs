@@ -86,7 +86,7 @@ impl<B: Backend> CausalConv1d<B> {
             .with_dilation(dilation)
             .with_groups(groups)
             .with_bias(true)
-            .with_padding(burn::nn::PaddingConfig1d::Explicit(0))
+            .with_padding(burn::nn::PaddingConfig1d::Explicit(0, 0))
             .init(device);
         let causal_padding = dilation * (kernel_size - 1);
         Self {

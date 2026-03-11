@@ -282,17 +282,15 @@ impl<B: Backend> TalkerModel<B> {
         mut hidden: Tensor<B, 3>,
         rope: &RoPEType<B>,
         kv_caches: &mut [KVCache<B>],
-        device: &B::Device,
+        _device: &B::Device,
     ) -> (Tensor<B, 3>, Tensor<B, 3>) {
-        let seq_len = hidden.dims()[1];
-        let mask = super::transformer::create_causal_mask::<B>(seq_len, 0, device);
-
         for (i, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(hidden, rope, Some(mask.clone()), Some(&mut kv_caches[i]), 0);
+            hidden = layer.forward(hidden, rope, true, Some(&mut kv_caches[i]), 0);
         }
 
         hidden = self.norm.forward(hidden);
 
+        let seq_len = hidden.dims()[1];
         let last_hidden = hidden.clone().narrow(1, seq_len - 1, 1);
         let logits = self.codec_head.forward(last_hidden);
 
@@ -450,7 +448,7 @@ impl<B: Backend> TalkerModel<B> {
     ) -> (Tensor<B, 3>, Tensor<B, 3>) {
         let mut hidden = input_embed;
         for (i, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(hidden, rope, None, Some(&mut kv_caches[i]), offset);
+            hidden = layer.forward(hidden, rope, false, Some(&mut kv_caches[i]), offset);
         }
 
         hidden = self.norm.forward(hidden);

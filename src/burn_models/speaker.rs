@@ -68,7 +68,7 @@ impl<B: Backend> ReflectPadConv1d<B> {
         let conv = Conv1dConfig::new(in_channels, out_channels, kernel_size)
             .with_dilation(dilation)
             .with_bias(true)
-            .with_padding(burn::nn::PaddingConfig1d::Explicit(0))
+            .with_padding(burn::nn::PaddingConfig1d::Explicit(0, 0))
             .init(device);
 
         Self {
@@ -172,11 +172,11 @@ impl<B: Backend> SqueezeExcitationBlock<B> {
     fn new(channels: usize, se_channels: usize, device: &B::Device) -> Self {
         let conv1 = Conv1dConfig::new(channels, se_channels, 1)
             .with_bias(true)
-            .with_padding(burn::nn::PaddingConfig1d::Explicit(0))
+            .with_padding(burn::nn::PaddingConfig1d::Explicit(0, 0))
             .init(device);
         let conv2 = Conv1dConfig::new(se_channels, channels, 1)
             .with_bias(true)
-            .with_padding(burn::nn::PaddingConfig1d::Explicit(0))
+            .with_padding(burn::nn::PaddingConfig1d::Explicit(0, 0))
             .init(device);
         Self { conv1, conv2 }
     }
@@ -239,7 +239,7 @@ impl<B: Backend> AttentiveStatisticsPooling<B> {
             tdnn: TimeDelayNetBlock::new(channels * 3, attention_channels, 1, 1, device),
             conv: Conv1dConfig::new(attention_channels, channels, 1)
                 .with_bias(true)
-                .with_padding(burn::nn::PaddingConfig1d::Explicit(0))
+                .with_padding(burn::nn::PaddingConfig1d::Explicit(0, 0))
                 .init(device),
         }
     }
@@ -331,7 +331,7 @@ impl<B: Backend> SpeakerEncoder<B> {
 
         let fc = Conv1dConfig::new(config.enc_channels[4] * 2, config.enc_dim, 1)
             .with_bias(true)
-            .with_padding(burn::nn::PaddingConfig1d::Explicit(0))
+            .with_padding(burn::nn::PaddingConfig1d::Explicit(0, 0))
             .init(device);
 
         Self {

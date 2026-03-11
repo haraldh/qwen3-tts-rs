@@ -186,7 +186,7 @@ impl<B: Backend> CodePredictor<B> {
         semantic_embed: Tensor<B, 3>,
         rope: &RoPEType<B>,
         cp_kv_caches: &mut [KVCache<B>],
-        device: &B::Device,
+        _device: &B::Device,
     ) -> Vec<u32> {
         for cache in cp_kv_caches.iter_mut() {
             cache.reset();
@@ -204,17 +204,10 @@ impl<B: Backend> CodePredictor<B> {
         };
 
         let seq_len = input.dims()[1];
-        let mask = super::transformer::create_causal_mask::<B>(seq_len, 0, device);
 
         let mut hidden = input;
         for (i, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(
-                hidden,
-                rope,
-                Some(mask.clone()),
-                Some(&mut cp_kv_caches[i]),
-                0,
-            );
+            hidden = layer.forward(hidden, rope, true, Some(&mut cp_kv_caches[i]), 0);
         }
         hidden = self.norm.forward(hidden);
 
@@ -240,7 +233,7 @@ impl<B: Backend> CodePredictor<B> {
 
             let mut h = code_embed;
             for (i, layer) in self.layers.iter().enumerate() {
-                h = layer.forward(h, rope, None, Some(&mut cp_kv_caches[i]), offset);
+                h = layer.forward(h, rope, false, Some(&mut cp_kv_caches[i]), offset);
             }
             h = self.norm.forward(h);
 
