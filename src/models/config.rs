@@ -701,7 +701,7 @@ mod tests {
             return;
         }
         let parsed = ParsedModelConfig::from_file(path).unwrap();
-        let tc = super::super::talker::TalkerConfig::from_parsed(&parsed);
+        let tc = super::super::TalkerConfig::from_parsed(&parsed);
         assert_eq!(tc.hidden_size, 1024);
         assert_eq!(tc.intermediate_size, 3072);
         assert_eq!(tc.text_embed_dim, 2048);
@@ -721,7 +721,7 @@ mod tests {
             return;
         }
         let parsed = ParsedModelConfig::from_file(path).unwrap();
-        let tc = super::super::talker::TalkerConfig::from_parsed(&parsed);
+        let tc = super::super::TalkerConfig::from_parsed(&parsed);
         assert_eq!(tc.hidden_size, 2048);
         assert_eq!(tc.intermediate_size, 6144);
         assert_eq!(tc.text_embed_dim, 2048);
@@ -731,12 +731,14 @@ mod tests {
     /// Verify CodePredictorConfig: 0.6B has no projection, 1.7B needs codec_embed_dim=2048
     #[test]
     fn test_from_parsed_code_predictor() {
+        use crate::burn_models::code_predictor::CodePredictorConfig;
+
         let path_06b = Path::new("test_data/models/0.6b-base/config.json");
         let path_17b = Path::new("test_data/models/1.7b-base/config.json");
 
         if path_06b.exists() {
             let parsed = ParsedModelConfig::from_file(path_06b).unwrap();
-            let cp = super::super::code_predictor::CodePredictorConfig::from_parsed(&parsed);
+            let cp = CodePredictorConfig::from_parsed(&parsed);
             assert_eq!(cp.hidden_size, 1024);
             assert_eq!(cp.intermediate_size, 3072);
             assert_eq!(cp.num_hidden_layers, 5);
@@ -746,7 +748,7 @@ mod tests {
 
         if path_17b.exists() {
             let parsed = ParsedModelConfig::from_file(path_17b).unwrap();
-            let cp = super::super::code_predictor::CodePredictorConfig::from_parsed(&parsed);
+            let cp = CodePredictorConfig::from_parsed(&parsed);
             assert_eq!(cp.hidden_size, 1024);
             assert_eq!(cp.codec_embed_dim, Some(2048)); // 1.7B: needs 2048→1024 projection
         }

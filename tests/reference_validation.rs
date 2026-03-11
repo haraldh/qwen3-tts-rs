@@ -1,3 +1,4 @@
+#![cfg(feature = "_candle_legacy")]
 //! Validation tests comparing Rust implementation against Python reference values
 //!
 //! This file contains tests that load pre-computed reference values from the Python

@@ -1,6 +1,7 @@
 //! Audio I/O utilities for loading, saving, and manipulating audio.
 
 use anyhow::{Context, Result};
+#[cfg(feature = "_candle_legacy")]
 use candle_core::Tensor;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use std::path::Path;
@@ -42,6 +43,7 @@ impl AudioBuffer {
     }
 
     /// Create from a Candle tensor (assumed shape: `[samples]` or `[1, samples]`)
+    #[cfg(feature = "_candle_legacy")]
     pub fn from_tensor(tensor: Tensor, sample_rate: u32) -> Result<Self> {
         let tensor = tensor.flatten_all()?;
         let samples: Vec<f32> = tensor.to_vec1()?;
@@ -49,6 +51,7 @@ impl AudioBuffer {
     }
 
     /// Convert to a Candle tensor
+    #[cfg(feature = "_candle_legacy")]
     pub fn to_tensor(&self, device: &candle_core::Device) -> Result<Tensor> {
         Ok(Tensor::new(self.samples.as_slice(), device)?)
     }
@@ -167,7 +170,6 @@ pub fn save_wav<P: AsRef<Path>>(path: P, samples: &[f32], sample_rate: u32) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
     use tempfile::tempdir;
 
     #[test]
@@ -235,8 +237,10 @@ mod tests {
         assert!((max_abs - 0.501187).abs() < 0.01); // 10^(-6/20) ≈ 0.501
     }
 
+    #[cfg(feature = "_candle_legacy")]
     #[test]
     fn test_to_tensor() {
+        use candle_core::Device;
         let buffer = AudioBuffer::new(vec![0.1, 0.2, 0.3], 24000);
         let device = Device::Cpu;
         let tensor = buffer.to_tensor(&device).unwrap();
@@ -247,8 +251,10 @@ mod tests {
         assert!((values[2] - 0.3).abs() < 1e-6);
     }
 
+    #[cfg(feature = "_candle_legacy")]
     #[test]
     fn test_from_tensor_1d() {
+        use candle_core::{Device, Tensor};
         let device = Device::Cpu;
         let tensor = Tensor::new(&[0.1f32, 0.2, 0.3], &device).unwrap();
         let buffer = AudioBuffer::from_tensor(tensor, 24000).unwrap();
@@ -256,8 +262,10 @@ mod tests {
         assert_eq!(buffer.sample_rate, 24000);
     }
 
+    #[cfg(feature = "_candle_legacy")]
     #[test]
     fn test_from_tensor_2d() {
+        use candle_core::{Device, Tensor};
         let device = Device::Cpu;
         let tensor = Tensor::new(&[[0.1f32, 0.2, 0.3]], &device).unwrap();
         let buffer = AudioBuffer::from_tensor(tensor, 24000).unwrap();

@@ -3,9 +3,12 @@
 //! Implementation based on librosa's mel spectrogram computation,
 //! optimized for the Qwen3-TTS speaker encoder requirements.
 
-use anyhow::Result;
-use candle_core::{Device, Tensor};
 use num_complex::Complex;
+
+#[cfg(feature = "_candle_legacy")]
+use anyhow::Result;
+#[cfg(feature = "_candle_legacy")]
+use candle_core::{Device, Tensor};
 use rustfft::{num_complex::Complex as FftComplex, FftPlanner};
 use std::f32::consts::PI;
 
@@ -108,6 +111,7 @@ impl MelSpectrogram {
     }
 
     /// Compute mel spectrogram and return as tensor
+    #[cfg(feature = "_candle_legacy")]
     pub fn compute_tensor(&self, samples: &[f32], device: &Device) -> Result<Tensor> {
         let mel = self.compute(samples);
         let n_frames = mel.len();
@@ -130,18 +134,14 @@ impl MelSpectrogram {
             .collect()
     }
 
-    /// Compute mel spectrogram for the speaker encoder.
+    /// Compute mel spectrogram for the speaker encoder (raw Vec output).
     ///
     /// Differs from [`Self::compute`] in two ways:
     /// - Uses **magnitude** spectrum (`sqrt(re² + im² + 1e-9)`) rather than power spectrum
     /// - Applies `log(clamp(mel, 1e-5))` compression
     ///
-    /// Returns a tensor of shape `[n_mels, n_frames]`.
-    pub fn compute_for_speaker_encoder(
-        &self,
-        samples: &[f32],
-        device: &Device,
-    ) -> anyhow::Result<Tensor> {
+    /// Returns shape `[n_mels][n_frames]`.
+    pub fn compute_for_speaker_encoder_raw(&self, samples: &[f32]) -> Vec<Vec<f32>> {
         let stft = self.stft(samples);
 
         // Magnitude spectrum (not power)
@@ -164,14 +164,30 @@ impl MelSpectrogram {
             .map(|frame| frame.into_iter().map(|v| v.max(1e-5).ln()).collect())
             .collect();
 
+        // Transpose from [n_frames, n_mels] to [n_mels, n_frames]
         let n_frames = log_mel.len();
         let n_mels = self.config.n_mels;
+        let mut transposed = vec![vec![0.0f32; n_frames]; n_mels];
+        for (f, frame) in log_mel.iter().enumerate() {
+            for (m, &val) in frame.iter().enumerate() {
+                transposed[m][f] = val;
+            }
+        }
+        transposed
+    }
 
-        let flat: Vec<f32> = log_mel.into_iter().flatten().collect();
-        let tensor = Tensor::new(flat.as_slice(), device)?
-            .reshape((n_frames, n_mels))?
-            .transpose(0, 1)?; // [n_mels, n_frames]
-
+    /// Compute mel spectrogram for the speaker encoder (candle Tensor output).
+    #[cfg(feature = "_candle_legacy")]
+    pub fn compute_for_speaker_encoder(
+        &self,
+        samples: &[f32],
+        device: &Device,
+    ) -> anyhow::Result<Tensor> {
+        let raw = self.compute_for_speaker_encoder_raw(samples);
+        let n_mels = raw.len();
+        let n_frames = raw[0].len();
+        let flat: Vec<f32> = raw.into_iter().flatten().collect();
+        let tensor = Tensor::new(flat.as_slice(), device)?.reshape((n_mels, n_frames))?;
         Ok(tensor)
     }
 
@@ -358,7 +374,6 @@ impl MelSpectrogram {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
 
     #[test]
     fn test_mel_config_default() {
@@ -472,8 +487,10 @@ mod tests {
         assert!(has_negative);
     }
 
+    #[cfg(feature = "_candle_legacy")]
     #[test]
     fn test_compute_tensor() {
+        use candle_core::Device;
         let mel = MelSpectrogram::new(MelConfig::default());
         let samples = vec![0.0f32; 4800]; // 0.2 seconds
         let device = Device::Cpu;

@@ -8,31 +8,30 @@ autobenches = false
 
 [features]
 default = ["cpu"]
-cpu = []
+cpu = ["burn/ndarray"]
 cli = ["clap", "indicatif"]
 hub = ["hf-hub"]
+_candle_legacy = []  # Gates old candle-based code during Burn migration
 
 # All platform-portable features. Use `cargo lint` / `cargo check-all` / `cargo test-all`
 # instead of --all-features (which fails because platform-specific features conflict).
 all-portable = ["cpu", "cli", "hub"]
 
 # Platform-specific — enable manually based on your hardware:
-#   macOS:         metal, accelerate
-#   Linux + Intel: mkl
-#   Linux + NVIDIA: cuda, flash-attn
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
-accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
-mkl = ["candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-flash-attn = ["cuda", "dep:candle-flash-attn"]
+#   macOS:         wgpu (Vulkan/Metal via CubeCL)
+#   Linux + Intel: cpu (with openblas if desired)
+#   Linux + NVIDIA: cuda
+#   Linux + AMD:   rocm
+cuda = ["burn/cuda"]
+rocm = ["burn/rocm"]
+wgpu = ["burn/wgpu"]
+vulkan = ["wgpu", "burn/vulkan"]
 profiling = ["dep:tracing-chrome"]
 
 [dependencies]
-# Candle ML framework
-candle-core = "0.9"
-candle-nn = "0.9"
-candle-transformers = "0.9"
-candle-flash-attn = { version = "0.9", optional = true }
+# Burn ML framework (replaces Candle)
+burn = { version = "0.20", default-features = false }
+safetensors = "0.4"
 
 # Tokenization (HuggingFace tokenizers in Rust)
 tokenizers = "0.22"
@@ -43,7 +42,6 @@ rubato = "1.0"            # High-quality resampling
 rustfft = "6.2"            # FFT for spectrograms
 
 # Serialization & model loading
-safetensors = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
@@ -67,7 +65,6 @@ audioadapter-buffers = "2.0.0"
 
 # Profiling (optional)
 tracing-chrome = { version = "0.7", optional = true }
-half = "2.7.1"
 
 [dev-dependencies]
 criterion = "0.8"

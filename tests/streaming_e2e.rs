@@ -1,18 +1,21 @@
 //! End-to-end streaming tests.
 //!
-//! These tests require real model weights and a CUDA GPU.
+//! These tests require real model weights.
 //! Run with:
-//!   cargo test --release --features cuda --test streaming_e2e -- --ignored --nocapture
+//!   cargo test --release --test streaming_e2e -- --ignored --nocapture
 
+use burn::backend::NdArray;
 use qwen3_tts::{Language, Qwen3TTS, Speaker, SynthesisOptions};
 
-fn load_model(model_dir: &str) -> Qwen3TTS {
-    let device = qwen3_tts::auto_device().expect("auto_device failed");
-    Qwen3TTS::from_pretrained(model_dir, device).expect("model load failed")
+type B = NdArray;
+
+fn load_model(model_dir: &str) -> Qwen3TTS<B> {
+    let device = Default::default();
+    Qwen3TTS::<B>::from_pretrained(model_dir, device).expect("model load failed")
 }
 
 #[test]
-#[ignore = "requires model weights + GPU"]
+#[ignore = "requires model weights"]
 fn test_streaming_custom_voice() {
     let model = load_model("test_data/models/1.7B-CustomVoice");
 
@@ -57,7 +60,7 @@ fn test_streaming_custom_voice() {
 }
 
 #[test]
-#[ignore = "requires model weights + GPU"]
+#[ignore = "requires model weights"]
 fn test_streaming_voice_design() {
     let model = load_model("test_data/models/1.7B-VoiceDesign");
 
@@ -102,7 +105,7 @@ fn test_streaming_voice_design() {
 }
 
 #[test]
-#[ignore = "requires model weights + GPU"]
+#[ignore = "requires model weights"]
 fn test_streaming_matches_non_streaming() {
     // Verify that streaming and non-streaming produce the same number of
     // samples for the same seed (deterministic generation).

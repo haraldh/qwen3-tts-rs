@@ -32,3 +32,4 @@ perf.data.old
 nsys_report.*
 /flamegraph.svg
 !/docs/flamegraph.svg
+.direnv/

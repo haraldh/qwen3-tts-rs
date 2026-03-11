@@ -1,24 +1,39 @@
 //! Neural network models for Qwen3-TTS
 //!
-//! This module contains:
-//! - `transformer`: Shared building blocks (KVCache, RoPE, RoPEType, Attention, MLP, DecoderLayer)
-//! - `talker`: TalkerModel for semantic token generation
-//! - `code_predictor`: Acoustic token predictor
-//! - `speaker`: Speaker encoder (ECAPA-TDNN)
-//! - `codec`: Audio codec for encoding/decoding
-//! - `config`: Model configuration
+//! This module contains framework-independent configuration types.
+//! The candle-based model implementations are behind `_candle_legacy` feature.
+//! See `burn_models` for the Burn-based implementations.
 
-pub mod code_predictor;
-pub mod codec;
+// Config is pure serde — always available
 pub mod config;
+
+// Framework-independent types (enums, configs, token constants)
+pub mod talker_types;
+
+// Candle-based implementations — only available with legacy feature
+#[cfg(feature = "_candle_legacy")]
+pub mod code_predictor;
+#[cfg(feature = "_candle_legacy")]
+pub mod codec;
+#[cfg(feature = "_candle_legacy")]
 pub mod fused_ops;
+#[cfg(feature = "_candle_legacy")]
 pub mod kv_cache;
+#[cfg(feature = "_candle_legacy")]
 pub mod speaker;
+#[cfg(feature = "_candle_legacy")]
 pub mod talker;
+#[cfg(feature = "_candle_legacy")]
 pub mod transformer;
 
-pub use code_predictor::{CodePredictor, CodePredictorConfig};
 pub use config::{ModelType, ParsedModelConfig, Qwen3TTSConfig, SpeakerEncoderConfig};
+pub use talker_types::{codec_tokens, special_tokens, tts_tokens, Language, Speaker, TalkerConfig};
+
+#[cfg(feature = "_candle_legacy")]
+pub use code_predictor::{CodePredictor, CodePredictorConfig};
+#[cfg(feature = "_candle_legacy")]
 pub use kv_cache::{AnyKVCache, KVCache, PreAllocKVCache};
-pub use talker::{TalkerConfig, TalkerModel};
+#[cfg(feature = "_candle_legacy")]
+pub use talker::TalkerModel;
+#[cfg(feature = "_candle_legacy")]
 pub use transformer::{MRoPE, RoPEType, RotaryEmbedding};

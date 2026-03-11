@@ -1,3 +1,4 @@
+#![cfg(feature = "_candle_legacy")]
 //! Debug test to compare Rust decoder stages with Python
 
 use anyhow::Result;

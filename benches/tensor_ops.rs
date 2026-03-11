@@ -2,10 +2,12 @@
 //!
 //! Run with: `cargo bench -- tensor_ops`
 
-use candle_core::Device;
+use burn::backend::NdArray;
+use burn::prelude::*;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use qwen3_tts::codes_to_tensor;
 use std::hint::black_box;
+
+type B = NdArray;
 
 /// Build `n_frames` dummy codec frames (16 codebooks each).
 fn make_frames(n_frames: usize) -> Vec<Vec<u32>> {
@@ -14,8 +16,20 @@ fn make_frames(n_frames: usize) -> Vec<Vec<u32>> {
         .collect()
 }
 
+/// Burn equivalent of codes_to_tensor: frame codes → [1, 16, T] Int tensor.
+fn codes_to_tensor(codes: &[Vec<u32>]) -> Tensor<B, 3, Int> {
+    let device: <B as Backend>::Device = Default::default();
+    let num_frames = codes.len();
+    let mut data = vec![0i32; 16 * num_frames];
+    for (frame, frame_codes) in codes.iter().enumerate() {
+        for (q, &code) in frame_codes.iter().enumerate() {
+            data[q * num_frames + frame] = code as i32;
+        }
+    }
+    Tensor::<B, 1, Int>::from_ints(data.as_slice(), &device).reshape([1, 16, num_frames])
+}
+
 fn bench_codes_to_tensor(c: &mut Criterion) {
-    let device = Device::Cpu;
     let mut group = c.benchmark_group("codes_to_tensor");
 
     // 12 frames ≈ 1s, 60 frames ≈ 5s, 240 frames ≈ 20s of audio at 12 Hz
@@ -25,7 +39,7 @@ fn bench_codes_to_tensor(c: &mut Criterion) {
             BenchmarkId::from_parameter(format!("{n_frames}_frames")),
             &n_frames,
             |b, _| {
-                b.iter(|| codes_to_tensor(black_box(&frames), &device).unwrap());
+                b.iter(|| codes_to_tensor(black_box(&frames)));
             },
         );
     }
