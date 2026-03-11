@@ -178,10 +178,12 @@ impl<B: Backend> TalkerModel<B> {
         }
     }
 
-    /// Create KV caches for generation (one per layer).
-    pub fn new_kv_caches(&self) -> Vec<KVCache<B>> {
+    /// Create pre-allocated KV caches for generation (one per layer).
+    ///
+    /// `max_seq` is the maximum total sequence length (prefill + decode steps).
+    pub fn new_kv_caches(&self, max_seq: usize, device: &B::Device) -> Vec<KVCache<B>> {
         (0..self.num_hidden_layers)
-            .map(|_| KVCache::new())
+            .map(|_| KVCache::new(1, self.num_key_value_heads, max_seq, self.head_dim, device))
             .collect()
     }
 

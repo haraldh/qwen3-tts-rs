@@ -491,7 +491,7 @@ mod tests {
         let device = Default::default();
         let attn = AttentionConfig::new(64, 4, 2, 16, 1e-6).init::<B>(&device);
         let rope = RoPEType::Standard(RotaryEmbedding::new(16, 512, 10000.0, &device));
-        let mut cache = KVCache::new();
+        let mut cache = KVCache::new(1, 2, 64, 16, &device);
 
         let input1 = Tensor::<B, 3>::zeros([1, 5, 64], &device);
         let _out1 = attn.forward(input1, &rope, None, Some(&mut cache), 0);
@@ -506,7 +506,7 @@ mod tests {
         let device = Default::default();
         let layer = DecoderLayerConfig::new(64, 128, 4, 2, 16, 1e-6).init::<B>(&device);
         let rope = RoPEType::Standard(RotaryEmbedding::new(16, 512, 10000.0, &device));
-        let mut cache = KVCache::new();
+        let mut cache = KVCache::new(1, 2, 64, 16, &device);
 
         let input = Tensor::<B, 3>::zeros([1, 8, 64], &device);
         let output = layer.forward(input, &rope, None, Some(&mut cache), 0);

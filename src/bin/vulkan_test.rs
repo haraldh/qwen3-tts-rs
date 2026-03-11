@@ -1,8 +1,21 @@
 //! Minimal test: does the Burn WGPU (SPIR-V/Vulkan) backend initialize and run?
+//!
+//! Requires the `wgpu` feature: cargo run --features wgpu --bin vulkan_test
+
+#[cfg(not(feature = "wgpu"))]
+fn main() {
+    eprintln!("This binary requires --features wgpu");
+    std::process::exit(1);
+}
+
+#[cfg(feature = "wgpu")]
 use burn::backend::wgpu::{Wgpu, WgpuDevice};
+#[cfg(feature = "wgpu")]
 use burn::tensor::Tensor;
+#[cfg(feature = "wgpu")]
 use std::time::Instant;
 
+#[cfg(feature = "wgpu")]
 fn main() {
     println!("Step 1: Creating device handle...");
     let t = Instant::now();

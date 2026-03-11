@@ -213,7 +213,9 @@ impl<B: Backend> Qwen3TTS<B> {
         #[cfg(feature = "profiling")]
         let _prefill_span = tracing::info_span!("prefill").entered();
 
-        let mut kv_caches = self.talker.new_kv_caches();
+        // Estimate max sequence: prefix (~15) + decode frames
+        let max_seq = input_ids.len() + 20 + gen_config.max_new_tokens;
+        let mut kv_caches = self.talker.new_kv_caches(max_seq, &self.device);
         let (hidden, logits) = self.talker.prefill_custom_voice(
             &input_ids,
             speaker,
@@ -288,7 +290,8 @@ impl<B: Backend> Qwen3TTS<B> {
         #[cfg(feature = "profiling")]
         let _prefill_span = tracing::info_span!("prefill").entered();
 
-        let mut kv_caches = self.talker.new_kv_caches();
+        let max_seq = input_ids.len() + instruct_ids.len() + 20 + gen_config.max_new_tokens;
+        let mut kv_caches = self.talker.new_kv_caches(max_seq, &self.device);
         let (hidden, logits) = self.talker.prefill_voice_design(
             &input_ids,
             &instruct_ids,
@@ -420,7 +423,8 @@ impl<B: Backend> Qwen3TTS<B> {
         let mut penalty_mask = vec![false; vocab_size];
 
         // Code predictor KV caches (reused + reset each frame)
-        let mut cp_kv_caches = self.code_predictor.new_kv_caches();
+        // CP processes: 2 prefill tokens + up to 14 autoregressive steps = 16
+        let mut cp_kv_caches = self.code_predictor.new_kv_caches(17, &self.device);
 
         // Sample first semantic token from prefill logits
         let logits_2d = initial_logits.squeeze_dim::<2>(1);
@@ -637,7 +641,8 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
         let (trailing_text_hidden, trailing_text_len, tts_pad_embed) =
             model.build_trailing_text(input_ids);
 
-        let mut kv_caches = model.talker.new_kv_caches();
+        let max_seq = input_ids.len() + 20 + config.max_new_tokens;
+        let mut kv_caches = model.talker.new_kv_caches(max_seq, &model.device);
         let prefill_result = model.talker.prefill_custom_voice(
             input_ids,
             speaker,
@@ -673,7 +678,8 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
         let (trailing_text_hidden, trailing_text_len, tts_pad_embed) =
             model.build_trailing_text(input_ids);
 
-        let mut kv_caches = model.talker.new_kv_caches();
+        let max_seq = input_ids.len() + instruct_ids.len() + 20 + config.max_new_tokens;
+        let mut kv_caches = model.talker.new_kv_caches(max_seq, &model.device);
         let prefill_result = model.talker.prefill_voice_design(
             input_ids,
             instruct_ids,
@@ -734,7 +740,7 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
         }
 
         let done = config.eos_token_id == Some(first_token);
-        let cp_kv_caches = model.code_predictor.new_kv_caches();
+        let cp_kv_caches = model.code_predictor.new_kv_caches(17, &model.device);
 
         Self {
             model,

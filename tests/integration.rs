@@ -134,15 +134,17 @@ mod model_tests {
 
     #[test]
     fn test_kv_cache_creation() {
+        let device = Default::default();
         let num_layers = 28;
-        let kv_caches: Vec<KVCache<B>> = (0..num_layers).map(|_| KVCache::new()).collect();
+        let kv_caches: Vec<KVCache<B>> =
+            (0..num_layers).map(|_| KVCache::new(1, 4, 64, 8, &device)).collect();
         assert_eq!(kv_caches.len(), num_layers);
     }
 
     #[test]
     fn test_kv_cache_update_and_reset() {
         let device = Default::default();
-        let mut cache = KVCache::<B>::new();
+        let mut cache = KVCache::<B>::new(1, 4, 64, 8, &device);
 
         // Initially empty
         assert!(cache.is_empty());

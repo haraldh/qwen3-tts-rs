@@ -93,6 +93,8 @@ pub struct CodePredictor<B: Backend> {
     #[module(skip)]
     num_code_groups: usize,
     #[module(skip)]
+    num_key_value_heads: usize,
+    #[module(skip)]
     head_dim: usize,
     #[module(skip)]
     rope_theta: f64,
@@ -151,6 +153,7 @@ impl<B: Backend> CodePredictor<B> {
             hidden_size: config.hidden_size,
             num_hidden_layers: config.num_hidden_layers,
             num_code_groups: config.num_code_groups,
+            num_key_value_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
             rope_theta: config.rope_theta,
         }
@@ -166,10 +169,13 @@ impl<B: Backend> CodePredictor<B> {
         ))
     }
 
-    /// Create KV caches for the code predictor (one per layer).
-    pub fn new_kv_caches(&self) -> Vec<KVCache<B>> {
+    /// Create pre-allocated KV caches for the code predictor (one per layer).
+    ///
+    /// The code predictor processes at most `prefill_len + 15` positions per frame
+    /// (2 prefill tokens + up to 14 autoregressive steps).
+    pub fn new_kv_caches(&self, max_seq: usize, device: &B::Device) -> Vec<KVCache<B>> {
         (0..self.num_hidden_layers)
-            .map(|_| KVCache::new())
+            .map(|_| KVCache::new(1, self.num_key_value_heads, max_seq, self.head_dim, device))
             .collect()
     }
 
