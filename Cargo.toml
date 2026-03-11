@@ -31,6 +31,7 @@ profiling = ["dep:tracing-chrome"]
 [dependencies]
 # Burn ML framework (replaces Candle)
 burn = { path = "/home/harald/git/burn/crates/burn", default-features = false }
+half = "2.7"
 safetensors = "0.4"
 
 # Tokenization (HuggingFace tokenizers in Rust)
@@ -105,6 +106,22 @@ inherits = "release"
 debug = true
 lto = false
 
-# Override cubecl-hip-sys for HIP 7.2 support (cubecl is resolved via local burn's workspace)
+# Override cubecl crates to use local builds (must match burn's local cubecl)
 [patch.crates-io]
+cubecl = { path = "/home/harald/git/cubecl/crates/cubecl" }
+cubecl-common = { path = "/home/harald/git/cubecl/crates/cubecl-common" }
+cubecl-core = { path = "/home/harald/git/cubecl/crates/cubecl-core" }
+cubecl-cpp = { path = "/home/harald/git/cubecl/crates/cubecl-cpp" }
+cubecl-cpu = { path = "/home/harald/git/cubecl/crates/cubecl-cpu" }
+cubecl-cuda = { path = "/home/harald/git/cubecl/crates/cubecl-cuda" }
+cubecl-hip = { path = "/home/harald/git/cubecl/crates/cubecl-hip" }
+cubecl-ir = { path = "/home/harald/git/cubecl/crates/cubecl-ir" }
+cubecl-macros = { path = "/home/harald/git/cubecl/crates/cubecl-macros" }
+cubecl-macros-internal = { path = "/home/harald/git/cubecl/crates/cubecl-macros-internal" }
+cubecl-opt = { path = "/home/harald/git/cubecl/crates/cubecl-opt" }
+cubecl-runtime = { path = "/home/harald/git/cubecl/crates/cubecl-runtime" }
+cubecl-spirv = { path = "/home/harald/git/cubecl/crates/cubecl-spirv" }
+cubecl-std = { path = "/home/harald/git/cubecl/crates/cubecl-std" }
+cubecl-wgpu = { path = "/home/harald/git/cubecl/crates/cubecl-wgpu" }
+cubecl-zspace = { path = "/home/harald/git/cubecl/crates/cubecl-zspace" }
 cubecl-hip-sys = { path = "/home/harald/git/cubecl-hip-sys/crates/cubecl-hip-sys" }

@@ -93,7 +93,8 @@ fn make_tensor_2d<B: Backend>(info: &TensorInfo, device: &B::Device) -> Tensor<B
         info.shape
     );
     Tensor::from_data(
-        burn::tensor::TensorData::new(info.data.clone(), info.shape.clone()),
+        burn::tensor::TensorData::new(info.data.clone(), info.shape.clone())
+            .convert::<B::FloatElem>(),
         device,
     )
 }
@@ -101,7 +102,8 @@ fn make_tensor_2d<B: Backend>(info: &TensorInfo, device: &B::Device) -> Tensor<B
 fn make_tensor_1d<B: Backend>(info: &TensorInfo, device: &B::Device) -> Tensor<B, 1> {
     let numel: usize = info.shape.iter().product();
     Tensor::from_data(
-        burn::tensor::TensorData::new(info.data.clone(), vec![numel]),
+        burn::tensor::TensorData::new(info.data.clone(), vec![numel])
+            .convert::<B::FloatElem>(),
         device,
     )
 }
@@ -114,7 +116,8 @@ fn make_tensor_3d<B: Backend>(info: &TensorInfo, device: &B::Device) -> Tensor<B
         info.shape
     );
     Tensor::from_data(
-        burn::tensor::TensorData::new(info.data.clone(), info.shape.clone()),
+        burn::tensor::TensorData::new(info.data.clone(), info.shape.clone())
+            .convert::<B::FloatElem>(),
         device,
     )
 }
@@ -509,6 +512,15 @@ pub fn load_talker<B: Backend>(
         false,
         device,
     )?;
+
+    // Store F32 copy of codec_head weights for mixed-precision decode.
+    // The weight is [codec_vocab_size, hidden_size] after transposition in load_linear.
+    // We store the original (pre-transpose) layout which is [codec_vocab_size, hidden_size].
+    let codec_head_weight_key = "codec_head.weight";
+    if let Some(info) = talker_weights.get(codec_head_weight_key) {
+        // info.data is already F32; shape is [codec_vocab_size, hidden_size]
+        talker.codec_head_f32 = Some(info.data.clone());
+    }
 
     tracing::info!("Loaded talker model ({} layers)", config.num_hidden_layers);
     Ok(talker)

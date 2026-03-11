@@ -682,7 +682,12 @@ impl<B: Backend> Decoder12Hz<B> {
         // Apply modulo to map 3072 vocab → 2048 codebook
         // We do this on CPU since modulo might not be directly available
         // Convert via float for backend-agnostic Int element type (I32 on WGPU, I64 on NdArray)
-        let first_codes_data: Vec<f32> = first_codes.float().into_data().to_vec().unwrap();
+        let first_codes_data: Vec<f32> = first_codes
+            .float()
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap();
         let codebook_size = self.codebook_size as i32;
         let first_codes_mod: Vec<i32> = first_codes_data
             .iter()
