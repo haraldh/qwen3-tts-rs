@@ -5,6 +5,7 @@
 
 use burn::nn::{Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
+use burn::tensor::{DType, Element};
 
 use super::kv_cache::KVCache;
 
@@ -13,7 +14,7 @@ use super::kv_cache::KVCache;
 /// Returns a `[1, 1, seq_len, offset + seq_len]` Bool tensor where position `(i, j)`
 /// is `true` if `j > offset + i` (masked) and `false` (allowed).
 ///
-/// Compatible with [`burn::tensor::module::attention`] which expects `true` = masked.
+/// `true` = masked (set to -inf before softmax).
 pub fn create_causal_mask<B: Backend>(
     seq_len: usize,
     offset: usize,
@@ -33,6 +34,7 @@ pub fn create_causal_mask<B: Backend>(
     // mask[i][j] = col > row  =>  true means "masked"
     cols.greater(rows)
 }
+
 
 /// Apply RoPE rotation to a tensor.
 ///
@@ -74,15 +76,19 @@ impl<B: Backend> RotaryEmbedding<B> {
             .collect();
         let half_dim = inv_freq.len();
 
-        let inv_freq = Tensor::<B, 1>::from_floats(inv_freq.as_slice(), device);
+        // Compute cos/sin in F32, then cast to backend dtype for storage.
+        // Matches PyTorch: Qwen2RotaryEmbedding computes in F32, returns .to(dtype=x.dtype).
+        let native_dtype = Tensor::<B, 1>::zeros([1], device).dtype();
+        let inv_freq = Tensor::<B, 1>::from_floats(inv_freq.as_slice(), device).cast(DType::F32);
         let positions: Vec<f32> = (0..max_seq_len).map(|i| i as f32).collect();
-        let positions =
-            Tensor::<B, 1>::from_floats(positions.as_slice(), device).unsqueeze_dim::<2>(1);
+        let positions = Tensor::<B, 1>::from_floats(positions.as_slice(), device)
+            .cast(DType::F32)
+            .unsqueeze_dim::<2>(1);
 
         // [max_seq_len, 1] @ [1, half_dim] -> [max_seq_len, half_dim]
         let freqs = positions.matmul(inv_freq.unsqueeze_dim::<2>(0));
-        let cos = freqs.clone().cos();
-        let sin = freqs.sin();
+        let cos = freqs.clone().cos().cast(native_dtype);
+        let sin = freqs.sin().cast(native_dtype);
 
         // Verify shapes
         debug_assert_eq!(cos.dims(), [max_seq_len, half_dim]);
@@ -117,11 +123,14 @@ pub struct MRoPE<B: Backend> {
 
 impl<B: Backend> MRoPE<B> {
     pub fn new(dim: usize, theta: f64, _mrope_section: [usize; 3], device: &B::Device) -> Self {
+        // Store inv_freq in F32 to preserve precision for on-the-fly cos/sin computation.
+        // Matches PyTorch's Qwen2RotaryEmbedding which keeps inv_freq in F32.
         let inv_freq: Vec<f32> = (0..dim)
             .step_by(2)
             .map(|i| 1.0 / (theta as f32).powf(i as f32 / dim as f32))
             .collect();
-        let inv_freq = Tensor::<B, 1>::from_floats(inv_freq.as_slice(), device);
+        let inv_freq =
+            Tensor::<B, 1>::from_floats(inv_freq.as_slice(), device).cast(DType::F32);
 
         Self {
             inv_freq,
@@ -137,14 +146,17 @@ impl<B: Backend> MRoPE<B> {
         seq_len: usize,
     ) -> (Tensor<B, 4>, Tensor<B, 4>) {
         let positions: Vec<f32> = (offset..offset + seq_len).map(|i| i as f32).collect();
-        let pos = Tensor::<B, 1>::from_floats(positions.as_slice(), &self.device);
+        let pos = Tensor::<B, 1>::from_floats(positions.as_slice(), &self.device)
+            .cast(DType::F32);
 
         let pos_col = pos.unsqueeze_dim::<2>(1); // [seq_len, 1]
         let inv_freq_row = self.inv_freq.clone().unsqueeze_dim::<2>(0); // [1, half_dim]
         let freqs = pos_col.matmul(inv_freq_row); // [seq_len, half_dim]
 
-        let cos = freqs.clone().cos();
-        let sin = freqs.sin();
+        // Compute cos/sin in F32, cast to Q/K dtype (matching PyTorch)
+        let q_dtype = q.dtype();
+        let cos = freqs.clone().cos().cast(q_dtype);
+        let sin = freqs.sin().cast(q_dtype);
 
         let q_rot = apply_rope_rotation(q, cos.clone(), sin.clone());
         let k_rot = apply_rope_rotation(k, cos, sin);
@@ -187,8 +199,7 @@ pub struct AttentionConfig {
 
 /// Multi-head attention with grouped-query attention and QK normalization.
 ///
-/// Uses [`burn::tensor::module::attention`] for scaled dot-product attention,
-/// which the CubeCL backend (ROCm/CUDA) overrides with a flash attention kernel.
+/// Uses manual matmul-based SDPA (flash attention has BF16 bugs on CubeCL).
 #[derive(Module, Debug)]
 pub struct Attention<B: Backend> {
     pub(crate) q_proj: Linear<B>,
@@ -282,12 +293,11 @@ impl<B: Backend> Attention<B> {
         let k = self.repeat_kv(k);
         let v = self.repeat_kv(v);
 
-        // Scaled dot-product attention (flash attention on CubeCL backends).
-        // The `is_causal` flag tells the backend to apply causal masking internally,
-        // which is more efficient than passing an explicit bool mask.
+        // Use burn's attention() which dispatches to flash attention on CubeCL backends.
         let options = burn::tensor::ops::AttentionModuleOptions {
+            scale: None,
+            softcap: None,
             is_causal,
-            ..Default::default()
         };
         let attn_output = burn::tensor::module::attention(q, k, v, None, None, options);
 
@@ -405,19 +415,43 @@ impl<B: Backend> DecoderLayer<B> {
         kv_cache: Option<&mut KVCache<B>>,
         offset: usize,
     ) -> Tensor<B, 3> {
-        // Self-attention with residual
-        let residual = hidden_states.clone();
-        let normed = self.input_layernorm.forward(hidden_states);
-        let attn_output = self
-            .self_attn
-            .forward(normed, rope, is_causal, kv_cache, offset);
-        let hidden_states = residual + attn_output;
+        // Detect mixed precision: hidden is F32 but backend native is BF16
+        let native_dtype: DType = B::FloatElem::dtype().into();
+        let mixed_precision = hidden_states.dtype() != native_dtype;
 
-        // MLP with residual
-        let residual = hidden_states.clone();
-        let normed = self.post_attention_layernorm.forward(hidden_states);
-        let mlp_output = self.mlp.forward(normed);
-        residual + mlp_output
+        if mixed_precision {
+            // F32 residual stream with BF16 matmuls: cast to native for norm+attention/MLP,
+            // cast back to F32 for residual additions. This preserves precision across layers
+            // while still using WMMA-accelerated BF16 linear ops.
+            let residual = hidden_states;
+            let normed = self
+                .input_layernorm
+                .forward(residual.clone().cast(native_dtype));
+            let attn_output = self
+                .self_attn
+                .forward(normed, rope, is_causal, kv_cache, offset);
+            let hidden_states = residual + attn_output.cast(DType::F32);
+
+            let residual = hidden_states;
+            let normed = self
+                .post_attention_layernorm
+                .forward(residual.clone().cast(native_dtype));
+            let mlp_output = self.mlp.forward(normed);
+            residual + mlp_output.cast(DType::F32)
+        } else {
+            // Standard path: all ops in native dtype
+            let residual = hidden_states.clone();
+            let normed = self.input_layernorm.forward(hidden_states);
+            let attn_output = self
+                .self_attn
+                .forward(normed, rope, is_causal, kv_cache, offset);
+            let hidden_states = residual + attn_output;
+
+            let residual = hidden_states.clone();
+            let normed = self.post_attention_layernorm.forward(hidden_states);
+            let mlp_output = self.mlp.forward(normed);
+            residual + mlp_output
+        }
     }
 }
 

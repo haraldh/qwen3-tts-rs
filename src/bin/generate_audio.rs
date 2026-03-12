@@ -22,7 +22,7 @@ use qwen3_tts::{AudioBuffer, Language, ModelType, Speaker, SynthesisOptions};
 type SelectedBackend = burn::backend::Cuda;
 
 #[cfg(all(feature = "rocm", not(feature = "cuda")))]
-type SelectedBackend = burn::backend::Rocm;
+type SelectedBackend = burn::backend::Rocm<half::bf16>;
 
 #[cfg(all(feature = "wgpu", not(feature = "cuda"), not(feature = "rocm")))]
 type SelectedBackend = burn::backend::Wgpu;

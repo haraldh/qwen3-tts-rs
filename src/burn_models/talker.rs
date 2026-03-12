@@ -2,6 +2,7 @@
 
 use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
+use burn::tensor::{DType, Element};
 
 use super::kv_cache::KVCache;
 use super::transformer::{DecoderLayer, DecoderLayerConfig, MRoPE, RoPEType, RotaryEmbedding};
@@ -46,11 +47,6 @@ pub struct TalkerModel<B: Backend> {
     pub(crate) layers: Vec<DecoderLayer<B>>,
     pub(crate) norm: RmsNorm<B>,
     pub(crate) codec_head: Linear<B>,
-    /// F32 copy of codec_head weights for mixed-precision decode.
-    /// On BF16 backends, the final logit projection uses this to preserve
-    /// precision for EOS detection. Shape: [codec_vocab_size, hidden_size] (row-major).
-    #[module(skip)]
-    pub(crate) codec_head_f32: Option<Vec<f32>>,
     // Config stored as individual fields to avoid Module derive issues
     #[module(skip)]
     text_vocab_size: usize,
@@ -114,7 +110,6 @@ impl<B: Backend> TalkerModel<B> {
             layers,
             norm,
             codec_head,
-            codec_head_f32: None,
             text_vocab_size: config.text_vocab_size,
             text_embed_dim: config.text_embed_dim,
             hidden_size: config.hidden_size,
@@ -290,10 +285,20 @@ impl<B: Backend> TalkerModel<B> {
         kv_caches: &mut [KVCache<B>],
         _device: &B::Device,
     ) -> (Tensor<B, 3>, Tensor<B, 3>) {
+        let native_dtype: DType = B::FloatElem::dtype().into();
+        let mixed_precision = native_dtype == DType::BF16;
+
+        if mixed_precision {
+            hidden = hidden.cast(DType::F32);
+        }
+
         for (i, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(hidden, rope, true, Some(&mut kv_caches[i]), 0);
         }
 
+        if mixed_precision {
+            hidden = hidden.cast(native_dtype);
+        }
         hidden = self.norm.forward(hidden);
 
         let seq_len = hidden.dims()[1];
@@ -445,9 +450,6 @@ impl<B: Backend> TalkerModel<B> {
     }
 
     /// Generate step with pre-built input embedding.
-    ///
-    /// When `codec_head_f32` is set (mixed-precision mode), the logit projection
-    /// is computed on CPU in F32 to preserve precision for EOS detection.
     pub fn generate_step_with_embed(
         &self,
         input_embed: Tensor<B, 3>,
@@ -455,45 +457,24 @@ impl<B: Backend> TalkerModel<B> {
         kv_caches: &mut [KVCache<B>],
         offset: usize,
     ) -> (Tensor<B, 3>, Tensor<B, 3>) {
-        let mut hidden = input_embed;
+        let native_dtype: DType = B::FloatElem::dtype().into();
+        let mixed_precision = native_dtype == DType::BF16;
+
+        let mut hidden = if mixed_precision {
+            input_embed.cast(DType::F32)
+        } else {
+            input_embed
+        };
+
         for (i, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(hidden, rope, false, Some(&mut kv_caches[i]), offset);
         }
 
+        if mixed_precision {
+            hidden = hidden.cast(native_dtype);
+        }
         hidden = self.norm.forward(hidden);
-        let logits = if let Some(ref w) = self.codec_head_f32 {
-            // Mixed-precision: compute logits on CPU in F32, then send back to device.
-            // For decode steps (seq_len=1), this is [1, hidden_size] @ [hidden_size, vocab] = tiny.
-            let device = hidden.device();
-            let [_, seq_len, hidden_size] = hidden.dims();
-            let vocab_size = self.codec_vocab_size;
-            let h_f32: Vec<f32> = hidden
-                .clone()
-                .reshape([seq_len * hidden_size])
-                .into_data()
-                .convert::<f32>()
-                .to_vec()
-                .unwrap();
-            // w is [vocab_size, hidden_size] row-major (Linear weight layout)
-            let mut logits_f32 = vec![0.0f32; seq_len * vocab_size];
-            for s in 0..seq_len {
-                let h_row = &h_f32[s * hidden_size..(s + 1) * hidden_size];
-                for v in 0..vocab_size {
-                    let w_row = &w[v * hidden_size..(v + 1) * hidden_size];
-                    let mut dot = 0.0f32;
-                    for k in 0..hidden_size {
-                        dot += h_row[k] * w_row[k];
-                    }
-                    logits_f32[s * vocab_size + v] = dot;
-                }
-            }
-            let logits_data =
-                burn::tensor::TensorData::new(logits_f32, [1, seq_len, vocab_size])
-                    .convert::<B::FloatElem>();
-            Tensor::from_data(logits_data, &device)
-        } else {
-            self.codec_head.forward(hidden.clone())
-        };
+        let logits = self.codec_head.forward(hidden.clone());
         (hidden, logits)
     }
 
