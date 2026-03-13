@@ -2,7 +2,6 @@
 
 use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
-use burn::tensor::{DType, Element};
 
 use super::kv_cache::KVCache;
 use super::transformer::{DecoderLayer, DecoderLayerConfig, MRoPE, RoPEType, RotaryEmbedding};
@@ -285,20 +284,10 @@ impl<B: Backend> TalkerModel<B> {
         kv_caches: &mut [KVCache<B>],
         _device: &B::Device,
     ) -> (Tensor<B, 3>, Tensor<B, 3>) {
-        let native_dtype: DType = B::FloatElem::dtype().into();
-        let mixed_precision = native_dtype == DType::BF16;
-
-        if mixed_precision {
-            hidden = hidden.cast(DType::F32);
-        }
-
         for (i, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(hidden, rope, true, Some(&mut kv_caches[i]), 0);
         }
 
-        if mixed_precision {
-            hidden = hidden.cast(native_dtype);
-        }
         hidden = self.norm.forward(hidden);
 
         let seq_len = hidden.dims()[1];
@@ -457,22 +446,12 @@ impl<B: Backend> TalkerModel<B> {
         kv_caches: &mut [KVCache<B>],
         offset: usize,
     ) -> (Tensor<B, 3>, Tensor<B, 3>) {
-        let native_dtype: DType = B::FloatElem::dtype().into();
-        let mixed_precision = native_dtype == DType::BF16;
-
-        let mut hidden = if mixed_precision {
-            input_embed.cast(DType::F32)
-        } else {
-            input_embed
-        };
+        let mut hidden = input_embed;
 
         for (i, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(hidden, rope, false, Some(&mut kv_caches[i]), offset);
         }
 
-        if mixed_precision {
-            hidden = hidden.cast(native_dtype);
-        }
         hidden = self.norm.forward(hidden);
         let logits = self.codec_head.forward(hidden.clone());
         (hidden, logits)

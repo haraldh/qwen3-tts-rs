@@ -5,7 +5,7 @@
 
 use burn::nn::{Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
-use burn::tensor::{DType, Element};
+use burn::tensor::DType;
 
 use super::kv_cache::KVCache;
 
@@ -28,13 +28,11 @@ pub fn create_causal_mask<B: Backend>(
 
     // Col indices [0, 1, ..., total_len-1] as [1,1,1,total_len]
     let cols: Vec<f32> = (0..total_len).map(|j| j as f32).collect();
-    let cols =
-        Tensor::<B, 1>::from_floats(cols.as_slice(), device).reshape([1, 1, 1, total_len]);
+    let cols = Tensor::<B, 1>::from_floats(cols.as_slice(), device).reshape([1, 1, 1, total_len]);
 
     // mask[i][j] = col > row  =>  true means "masked"
     cols.greater(rows)
 }
-
 
 /// Apply RoPE rotation to a tensor.
 ///
@@ -129,8 +127,7 @@ impl<B: Backend> MRoPE<B> {
             .step_by(2)
             .map(|i| 1.0 / (theta as f32).powf(i as f32 / dim as f32))
             .collect();
-        let inv_freq =
-            Tensor::<B, 1>::from_floats(inv_freq.as_slice(), device).cast(DType::F32);
+        let inv_freq = Tensor::<B, 1>::from_floats(inv_freq.as_slice(), device).cast(DType::F32);
 
         Self {
             inv_freq,
@@ -146,8 +143,7 @@ impl<B: Backend> MRoPE<B> {
         seq_len: usize,
     ) -> (Tensor<B, 4>, Tensor<B, 4>) {
         let positions: Vec<f32> = (offset..offset + seq_len).map(|i| i as f32).collect();
-        let pos = Tensor::<B, 1>::from_floats(positions.as_slice(), &self.device)
-            .cast(DType::F32);
+        let pos = Tensor::<B, 1>::from_floats(positions.as_slice(), &self.device).cast(DType::F32);
 
         let pos_col = pos.unsqueeze_dim::<2>(1); // [seq_len, 1]
         let inv_freq_row = self.inv_freq.clone().unsqueeze_dim::<2>(0); // [1, half_dim]
@@ -415,43 +411,17 @@ impl<B: Backend> DecoderLayer<B> {
         kv_cache: Option<&mut KVCache<B>>,
         offset: usize,
     ) -> Tensor<B, 3> {
-        // Detect mixed precision: hidden is F32 but backend native is BF16
-        let native_dtype: DType = B::FloatElem::dtype().into();
-        let mixed_precision = hidden_states.dtype() != native_dtype;
+        let residual = hidden_states.clone();
+        let normed = self.input_layernorm.forward(hidden_states);
+        let attn_output = self
+            .self_attn
+            .forward(normed, rope, is_causal, kv_cache, offset);
+        let hidden_states = residual + attn_output;
 
-        if mixed_precision {
-            // F32 residual stream with BF16 matmuls: cast to native for norm+attention/MLP,
-            // cast back to F32 for residual additions. This preserves precision across layers
-            // while still using WMMA-accelerated BF16 linear ops.
-            let residual = hidden_states;
-            let normed = self
-                .input_layernorm
-                .forward(residual.clone().cast(native_dtype));
-            let attn_output = self
-                .self_attn
-                .forward(normed, rope, is_causal, kv_cache, offset);
-            let hidden_states = residual + attn_output.cast(DType::F32);
-
-            let residual = hidden_states;
-            let normed = self
-                .post_attention_layernorm
-                .forward(residual.clone().cast(native_dtype));
-            let mlp_output = self.mlp.forward(normed);
-            residual + mlp_output.cast(DType::F32)
-        } else {
-            // Standard path: all ops in native dtype
-            let residual = hidden_states.clone();
-            let normed = self.input_layernorm.forward(hidden_states);
-            let attn_output = self
-                .self_attn
-                .forward(normed, rope, is_causal, kv_cache, offset);
-            let hidden_states = residual + attn_output;
-
-            let residual = hidden_states.clone();
-            let normed = self.post_attention_layernorm.forward(hidden_states);
-            let mlp_output = self.mlp.forward(normed);
-            residual + mlp_output
-        }
+        let residual = hidden_states.clone();
+        let normed = self.post_attention_layernorm.forward(hidden_states);
+        let mlp_output = self.mlp.forward(normed);
+        residual + mlp_output
     }
 }
 

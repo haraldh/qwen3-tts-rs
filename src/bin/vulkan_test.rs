@@ -42,7 +42,10 @@ fn main() {
     let z = x.matmul(y);
     let data = z.to_data();
     println!("  Matmul completed in {:?}", t.elapsed());
-    println!("  Result[0,0] = {:?} (expected 64.0)", data.as_slice::<f32>().unwrap()[0]);
+    println!(
+        "  Result[0,0] = {:?} (expected 64.0)",
+        data.as_slice::<f32>().unwrap()[0]
+    );
 
     println!("All steps passed!");
 }

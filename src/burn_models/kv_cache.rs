@@ -49,11 +49,7 @@ impl<B: Backend> KVCache<B> {
     /// Write new K/V entries and return the valid cached portion.
     ///
     /// `k` and `v` have shape `[batch, num_heads, new_seq, head_dim]`.
-    pub fn update(
-        &mut self,
-        k: Tensor<B, 4>,
-        v: Tensor<B, 4>,
-    ) -> (Tensor<B, 4>, Tensor<B, 4>) {
+    pub fn update(&mut self, k: Tensor<B, 4>, v: Tensor<B, 4>) -> (Tensor<B, 4>, Tensor<B, 4>) {
         let new_seq = k.dims()[2];
         let end = self.len + new_seq;
         debug_assert!(
@@ -69,11 +65,21 @@ impl<B: Backend> KVCache<B> {
         let v_buf = self.v.take().unwrap();
 
         let k_buf = k_buf.slice_assign(
-            [0..k.dims()[0], 0..k.dims()[1], self.len..end, 0..k.dims()[3]],
+            [
+                0..k.dims()[0],
+                0..k.dims()[1],
+                self.len..end,
+                0..k.dims()[3],
+            ],
             k,
         );
         let v_buf = v_buf.slice_assign(
-            [0..v.dims()[0], 0..v.dims()[1], self.len..end, 0..v.dims()[3]],
+            [
+                0..v.dims()[0],
+                0..v.dims()[1],
+                self.len..end,
+                0..v.dims()[3],
+            ],
             v,
         );
         self.len = end;

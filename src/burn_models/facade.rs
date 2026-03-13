@@ -23,6 +23,19 @@ use super::tts::{self, SuppressionMask};
 /// The codec end-of-sequence token ID (2150).
 pub const CODEC_EOS_TOKEN_ID: u32 = codec_tokens::CODEC_EOS;
 
+/// Set a single position in a Bool tensor to `true` via scatter.
+fn set_penalty_bit<B: Backend>(
+    mask: &Tensor<B, 1, Bool>,
+    idx: usize,
+    device: &B::Device,
+) -> Tensor<B, 1, Bool> {
+    #[allow(clippy::single_range_in_vec_init)]
+    let one_hot = Tensor::<B, 1, Int>::zeros([mask.dims()[0]], device)
+        .slice_assign([idx..idx + 1], Tensor::<B, 1, Int>::ones([1], device))
+        .equal_elem(1);
+    mask.clone().bool_or(one_hot)
+}
+
 /// Number of audio samples per codec frame at 24kHz (1920 = 80ms at 12Hz).
 pub const SAMPLES_PER_FRAME: usize = 1920;
 
@@ -419,8 +432,8 @@ impl<B: Backend> Qwen3TTS<B> {
         let suppression =
             tts::build_suppression_mask::<B>(vocab_size, CODEC_EOS_TOKEN_ID, &self.device);
 
-        // CPU-side repetition penalty mask
-        let mut penalty_mask = vec![false; vocab_size];
+        // GPU-resident repetition penalty mask (all false initially)
+        let mut penalty_mask = Tensor::<B, 1, Int>::zeros([vocab_size], &self.device).equal_elem(1);
 
         // Code predictor KV caches (reused + reset each frame)
         // CP processes: 2 prefill tokens + up to 14 autoregressive steps = 16
@@ -432,7 +445,8 @@ impl<B: Backend> Qwen3TTS<B> {
             self.apply_generation_penalties(logits_2d, &penalty_mask, gen_config, 0, &suppression);
         let mut semantic_token = sampling::sample(logits_2d, gen_config, sampling_ctx);
         if (semantic_token as usize) < vocab_size {
-            penalty_mask[semantic_token as usize] = true;
+            penalty_mask =
+                set_penalty_bit::<B>(&penalty_mask, semantic_token as usize, &self.device);
         }
         let mut token_count: usize = 1;
 
@@ -527,7 +541,8 @@ impl<B: Backend> Qwen3TTS<B> {
             );
             semantic_token = sampling::sample(logits_2d, gen_config, sampling_ctx);
             if (semantic_token as usize) < vocab_size {
-                penalty_mask[semantic_token as usize] = true;
+                penalty_mask =
+                    set_penalty_bit::<B>(&penalty_mask, semantic_token as usize, &self.device);
             }
             token_count += 1;
             t_sample_total += t.elapsed();
@@ -537,23 +552,29 @@ impl<B: Backend> Qwen3TTS<B> {
         let frames = all_codes.len();
         eprintln!(
             "Generation loop: {} frames in {:.1?} ({:.1}ms/frame)",
-            frames, loop_elapsed, loop_elapsed.as_secs_f64() * 1000.0 / frames.max(1) as f64
+            frames,
+            loop_elapsed,
+            loop_elapsed.as_secs_f64() * 1000.0 / frames.max(1) as f64
         );
         eprintln!(
             "  Code predictor: {:.1?} ({:.1}%)",
-            t_cp_total, t_cp_total.as_secs_f64() / loop_elapsed.as_secs_f64() * 100.0
+            t_cp_total,
+            t_cp_total.as_secs_f64() / loop_elapsed.as_secs_f64() * 100.0
         );
         eprintln!(
             "  Talker step:    {:.1?} ({:.1}%)",
-            t_talker_total, t_talker_total.as_secs_f64() / loop_elapsed.as_secs_f64() * 100.0
+            t_talker_total,
+            t_talker_total.as_secs_f64() / loop_elapsed.as_secs_f64() * 100.0
         );
         eprintln!(
             "  Embed+fuse:     {:.1?} ({:.1}%)",
-            t_embed_total, t_embed_total.as_secs_f64() / loop_elapsed.as_secs_f64() * 100.0
+            t_embed_total,
+            t_embed_total.as_secs_f64() / loop_elapsed.as_secs_f64() * 100.0
         );
         eprintln!(
             "  Sampling:       {:.1?} ({:.1}%)",
-            t_sample_total, t_sample_total.as_secs_f64() / loop_elapsed.as_secs_f64() * 100.0
+            t_sample_total,
+            t_sample_total.as_secs_f64() / loop_elapsed.as_secs_f64() * 100.0
         );
 
         all_codes
@@ -563,12 +584,12 @@ impl<B: Backend> Qwen3TTS<B> {
     fn apply_generation_penalties(
         &self,
         logits: Tensor<B, 2>,
-        penalty_mask: &[bool],
+        penalty_mask: &Tensor<B, 1, Bool>,
         config: &GenerationConfig,
         token_count: usize,
         suppression: &SuppressionMask<B>,
     ) -> Tensor<B, 2> {
-        // 1. Repetition penalty (CPU-based)
+        // 1. Repetition penalty (GPU-resident)
         let logits = if config.repetition_penalty != 1.0 {
             sampling::apply_repetition_penalty_with_mask(
                 logits,
@@ -621,7 +642,7 @@ pub struct StreamingSession<'a, B: Backend> {
     trailing_text_hidden: Tensor<B, 3>,
     trailing_text_len: usize,
     tts_pad_embed: Tensor<B, 3>,
-    penalty_mask: Vec<bool>,
+    penalty_mask: Tensor<B, 1, Bool>,
     token_count: usize,
     suppression_mask: SuppressionMask<B>,
     cp_kv_caches: Vec<KVCache<B>>,
@@ -723,7 +744,8 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
         let suppression_mask =
             tts::build_suppression_mask::<B>(vocab_size, CODEC_EOS_TOKEN_ID, &model.device);
 
-        let mut penalty_mask = vec![false; vocab_size];
+        let mut penalty_mask =
+            Tensor::<B, 1, Int>::zeros([vocab_size], &model.device).equal_elem(1);
 
         // Sample first semantic token
         let logits_2d = logits.squeeze_dim::<2>(1);
@@ -736,7 +758,7 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
         );
         let first_token = sampling::sample(logits_2d, &config, &mut sampling_ctx);
         if (first_token as usize) < vocab_size {
-            penalty_mask[first_token as usize] = true;
+            penalty_mask = set_penalty_bit::<B>(&penalty_mask, first_token as usize, &model.device);
         }
 
         let done = config.eos_token_id == Some(first_token);
@@ -850,7 +872,11 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
             let next_token = sampling::sample(logits_2d, &self.config, &mut self.sampling_ctx);
             let vocab_size = codec_tokens::CODEC_VOCAB_SIZE;
             if (next_token as usize) < vocab_size {
-                self.penalty_mask[next_token as usize] = true;
+                self.penalty_mask = set_penalty_bit::<B>(
+                    &self.penalty_mask,
+                    next_token as usize,
+                    &self.model.device,
+                );
             }
             self.token_count += 1;
 

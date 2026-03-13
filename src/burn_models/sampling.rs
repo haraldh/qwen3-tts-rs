@@ -173,38 +173,44 @@ pub fn greedy_sample<B: Backend>(logits: Tensor<B, 2>) -> u32 {
     argmax_vec(&vals) as u32
 }
 
-/// Apply repetition penalty to logits using a pre-built boolean mask.
+/// Apply repetition penalty to logits using a device-resident boolean mask.
 ///
 /// The mask has `true` at positions of previously generated tokens.
+/// Stays entirely on GPU — no CPU roundtrip.
 pub fn apply_repetition_penalty_with_mask<B: Backend>(
     logits: Tensor<B, 2>,
-    penalty_mask: &[bool],
+    penalty_mask: &Tensor<B, 1, Bool>,
     penalty: f64,
-    device: &B::Device,
+    _device: &B::Device,
 ) -> Tensor<B, 2> {
     if (penalty - 1.0).abs() < 1e-9 {
         return logits;
     }
 
     let [batch, vocab] = logits.dims();
-    let logits_vec: Vec<f32> = logits.into_data().convert::<f32>().to_vec().unwrap();
-    let penalty_f32 = penalty as f32;
+    let device = logits.device();
+    let mask_2d = penalty_mask
+        .clone()
+        .unsqueeze_dim::<2>(0)
+        .expand([batch, vocab]);
 
-    let mut result = logits_vec;
-    for b in 0..batch {
-        for v in 0..vocab {
-            let idx = b * vocab + v;
-            if v < penalty_mask.len() && penalty_mask[v] {
-                if result[idx] > 0.0 {
-                    result[idx] /= penalty_f32;
-                } else {
-                    result[idx] *= penalty_f32;
-                }
-            }
-        }
-    }
+    // For tokens in mask: positive logits get divided by penalty, negative get multiplied.
+    // Equivalent: logits * where(mask && logits > 0, 1/penalty, where(mask && logits < 0, penalty, 1.0))
+    let penalty_val = penalty as f32;
+    let inv_penalty = 1.0 / penalty_val;
 
-    Tensor::<B, 1>::from_floats(result.as_slice(), device).reshape([batch, vocab])
+    let ones = Tensor::<B, 2>::ones([batch, vocab], &device);
+    let pos_factors = Tensor::<B, 2>::full([batch, vocab], inv_penalty, &device);
+    let neg_factors = Tensor::<B, 2>::full([batch, vocab], penalty_val, &device);
+
+    // positive logits: factor = 1/penalty; negative logits: factor = penalty
+    let positive = logits.clone().greater_elem(0.0);
+    let factors = neg_factors.mask_where(positive, pos_factors);
+
+    // Only apply to masked positions; unmasked positions get factor=1.0
+    let factors = ones.mask_where(mask_2d, factors);
+
+    logits * factors
 }
 
 // ── Vec-based helpers (CPU sampling path) ───────────────────────────────
@@ -390,7 +396,7 @@ mod tests {
     fn test_repetition_penalty_no_penalty() {
         let device = Default::default();
         let logits = Tensor::<B, 2>::from_floats([[1.0f32, 2.0, 3.0]], &device);
-        let mask = vec![true, false, false];
+        let mask = Tensor::<B, 1, Bool>::from_data([true, false, false], &device);
         let result = apply_repetition_penalty_with_mask(logits, &mask, 1.0, &device);
         let vals: Vec<f32> = result.into_data().to_vec().unwrap();
         assert!((vals[0] - 1.0).abs() < 1e-5);
@@ -402,7 +408,7 @@ mod tests {
     fn test_repetition_penalty_with_penalty() {
         let device = Default::default();
         let logits = Tensor::<B, 2>::from_floats([[2.0f32, 3.0, 4.0]], &device);
-        let mask = vec![true, false, false];
+        let mask = Tensor::<B, 1, Bool>::from_data([true, false, false], &device);
         let result = apply_repetition_penalty_with_mask(logits, &mask, 2.0, &device);
         let vals: Vec<f32> = result.into_data().to_vec().unwrap();
         assert!((vals[0] - 1.0).abs() < 1e-5); // 2.0 / 2.0

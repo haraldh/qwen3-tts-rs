@@ -136,8 +136,9 @@ mod model_tests {
     fn test_kv_cache_creation() {
         let device = Default::default();
         let num_layers = 28;
-        let kv_caches: Vec<KVCache<B>> =
-            (0..num_layers).map(|_| KVCache::new(1, 4, 64, 8, &device)).collect();
+        let kv_caches: Vec<KVCache<B>> = (0..num_layers)
+            .map(|_| KVCache::new(1, 4, 64, 8, &device))
+            .collect();
         assert_eq!(kv_caches.len(), num_layers);
     }
 
@@ -199,7 +200,7 @@ mod generation_tests {
         let logits = Tensor::<B, 2>::from_floats([[2.0f32, 3.0, 4.0]], &device);
 
         // Mark token 0 as previously generated
-        let penalty_mask = vec![true, false, false];
+        let penalty_mask = Tensor::<B, 1, Bool>::from_data([true, false, false], &device);
 
         let penalized = qwen3_tts::burn_models::sampling::apply_repetition_penalty_with_mask::<B>(
             logits,
