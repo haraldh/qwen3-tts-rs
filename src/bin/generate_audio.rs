@@ -52,19 +52,19 @@ struct Args {
     duration: Option<f64>,
 
     /// Sampling temperature
-    #[arg(long, default_value_t = 0.7)]
+    #[arg(long, default_value_t = 0.3)]
     temperature: f64,
 
     /// Top-k sampling parameter
-    #[arg(long, default_value_t = 50)]
+    #[arg(long, default_value_t = 20)]
     top_k: usize,
 
     /// Top-p (nucleus) sampling parameter
     #[arg(long, default_value_t = 0.9)]
     top_p: f64,
 
-    /// Repetition penalty (1.0 = disabled, 1.05 = Python default)
-    #[arg(long, default_value_t = 1.05)]
+    /// Repetition penalty (1.0 = disabled)
+    #[arg(long, default_value_t = 1.2)]
     repetition_penalty: f64,
 
     /// Model directory containing model.safetensors

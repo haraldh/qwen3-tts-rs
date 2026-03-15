@@ -619,6 +619,275 @@ impl<B: Backend> Qwen3TTS<B> {
 
         logits
     }
+
+    /// Traced variant of [`generate_codes`] for divergence analysis.
+    ///
+    /// Identical generation logic, but calls `trace_callback` each frame with
+    /// diagnostic data (pre/post-penalty logits, hidden norm, top-5 tokens).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_codes_traced(
+        &self,
+        gen_config: &GenerationConfig,
+        sampling_ctx: &mut SamplingContext,
+        kv_caches: &mut [KVCache<B>],
+        mut offset: usize,
+        mut last_hidden: Tensor<B, 3>,
+        initial_logits: Tensor<B, 3>,
+        trailing_text_hidden: &Tensor<B, 3>,
+        trailing_text_len: usize,
+        tts_pad_embed: &Tensor<B, 3>,
+        mut trace_callback: impl FnMut(&FrameTrace),
+    ) -> FrameCodes {
+        let vocab_size = codec_tokens::CODEC_VOCAB_SIZE;
+        let eos_idx = CODEC_EOS_TOKEN_ID as usize;
+
+        let suppression =
+            tts::build_suppression_mask::<B>(vocab_size, CODEC_EOS_TOKEN_ID, &self.device);
+        let mut penalty_mask =
+            Tensor::<B, 1, Int>::zeros([vocab_size], &self.device).equal_elem(1);
+        let mut cp_kv_caches = self.code_predictor.new_kv_caches(17, &self.device);
+
+        // Sample first semantic token from prefill logits + emit trace
+        let logits_2d = initial_logits.squeeze_dim::<2>(1);
+        let raw_logits_f32 = extract_logits_f32(&logits_2d);
+        let logits_2d = self.apply_generation_penalties(
+            logits_2d,
+            &penalty_mask,
+            gen_config,
+            0,
+            &suppression,
+        );
+        let post_logits_f32 = extract_logits_f32(&logits_2d);
+        let mut semantic_token = sampling::sample(logits_2d, gen_config, sampling_ctx);
+
+        // Hidden norm for prefill
+        let hidden_data = last_hidden.clone().into_data().convert::<f32>();
+        let hidden_norm = l2_norm(hidden_data.as_slice::<f32>().unwrap());
+
+        trace_callback(&build_frame_trace(
+            usize::MAX, // sentinel for "prefill"
+            semantic_token,
+            &raw_logits_f32,
+            &post_logits_f32,
+            eos_idx,
+            hidden_norm,
+            vec![],
+            vec![],
+        ));
+
+        if (semantic_token as usize) < vocab_size {
+            penalty_mask =
+                set_penalty_bit::<B>(&penalty_mask, semantic_token as usize, &self.device);
+        }
+        let mut token_count: usize = 1;
+        let mut all_codes: FrameCodes = Vec::new();
+
+        for frame_idx in 0..gen_config.max_new_tokens {
+            if let Some(eos_id) = gen_config.eos_token_id {
+                if semantic_token == eos_id {
+                    break;
+                }
+            }
+
+            let semantic_embed = self
+                .talker
+                .get_codec_embedding(semantic_token, &self.device);
+
+            let (acoustic_codes, code_logits) =
+                self.code_predictor.generate_acoustic_codes_traced(
+                    last_hidden.clone(),
+                    semantic_embed.clone(),
+                    &self.cp_rope,
+                    &mut cp_kv_caches,
+                    &self.device,
+                );
+
+            let mut frame = Vec::with_capacity(16);
+            frame.push(semantic_token);
+            frame.extend_from_slice(&acoustic_codes);
+            all_codes.push(frame);
+
+            let acoustic_embed_sum = self
+                .code_predictor
+                .get_acoustic_embeddings_sum(&acoustic_codes, &self.device);
+            let summed = semantic_embed + acoustic_embed_sum;
+
+            let text_addition = if frame_idx < trailing_text_len {
+                trailing_text_hidden.clone().narrow(1, frame_idx, 1)
+            } else {
+                tts_pad_embed.clone()
+            };
+            let step_input = summed + text_addition;
+
+            let (h, new_logits) = self
+                .talker
+                .generate_step_with_embed(step_input, &self.rope, kv_caches, offset);
+            offset += 1;
+            last_hidden = h;
+
+            // Extract raw logits before penalties
+            let logits_2d = new_logits.squeeze_dim::<2>(1);
+            let raw_logits_f32 = extract_logits_f32(&logits_2d);
+
+            let logits_2d = self.apply_generation_penalties(
+                logits_2d,
+                &penalty_mask,
+                gen_config,
+                token_count,
+                &suppression,
+            );
+            let post_logits_f32 = extract_logits_f32(&logits_2d);
+
+            semantic_token = sampling::sample(logits_2d, gen_config, sampling_ctx);
+
+            // Hidden norm
+            let hidden_data = last_hidden.clone().into_data().convert::<f32>();
+            let hidden_norm = l2_norm(hidden_data.as_slice::<f32>().unwrap());
+
+            trace_callback(&build_frame_trace(
+                frame_idx,
+                semantic_token,
+                &raw_logits_f32,
+                &post_logits_f32,
+                eos_idx,
+                hidden_norm,
+                acoustic_codes.clone(),
+                code_logits,
+            ));
+
+            if (semantic_token as usize) < vocab_size {
+                penalty_mask =
+                    set_penalty_bit::<B>(&penalty_mask, semantic_token as usize, &self.device);
+            }
+            token_count += 1;
+        }
+
+        all_codes
+    }
+
+    /// Run CustomVoice synthesis with per-frame tracing.
+    pub fn synthesize_with_voice_traced(
+        &self,
+        text: &str,
+        speaker: Speaker,
+        language: Language,
+        options: Option<SynthesisOptions>,
+        trace_callback: impl FnMut(&FrameTrace),
+    ) -> anyhow::Result<AudioBuffer> {
+        let options = options.unwrap_or_default();
+        let mut sampling_ctx = SamplingContext::new(options.seed);
+        let input_ids = self.text_tokenizer.encode(text)?;
+        let gen_config = options.to_gen_config();
+
+        let (trailing_text_hidden, trailing_text_len, tts_pad_embed) =
+            self.build_trailing_text(&input_ids);
+
+        let max_seq = input_ids.len() + 20 + gen_config.max_new_tokens;
+        let mut kv_caches = self.talker.new_kv_caches(max_seq, &self.device);
+        let (hidden, logits) = self.talker.prefill_custom_voice(
+            &input_ids,
+            speaker,
+            language,
+            &self.rope,
+            &mut kv_caches,
+            &self.device,
+        );
+        let prefill_len = hidden.dims()[1];
+        let last_hidden = hidden.narrow(1, prefill_len - 1, 1);
+
+        let all_codes = self.generate_codes_traced(
+            &gen_config,
+            &mut sampling_ctx,
+            &mut kv_caches,
+            prefill_len,
+            last_hidden,
+            logits,
+            &trailing_text_hidden,
+            trailing_text_len,
+            &tts_pad_embed,
+            trace_callback,
+        );
+
+        self.decode_codes(&all_codes)
+    }
+}
+
+/// Per-frame diagnostic data for divergence analysis.
+pub struct FrameTrace {
+    /// Frame index (usize::MAX = prefill token)
+    pub frame_idx: usize,
+    /// The sampled semantic token
+    pub sampled_token: u32,
+    /// Top-5 token IDs (descending by logit, pre-penalty)
+    pub top5_tokens: [u32; 5],
+    /// Top-5 logit values (pre-penalty)
+    pub top5_logits: [f32; 5],
+    /// EOS logit before penalties
+    pub eos_logit: f32,
+    /// EOS logit after penalties
+    pub eos_logit_post: f32,
+    /// L2 norm of last_hidden state
+    pub hidden_norm: f32,
+    /// The 15 acoustic codes from code predictor (empty for prefill)
+    pub acoustic_codes: Vec<u32>,
+    /// Per-code diagnostics: (top1_id, top1_logit, top2_id, top2_logit) for each acoustic code
+    /// Empty for prefill. Shows argmax margin (top1 - top2) to gauge confidence.
+    pub code_logits: Vec<(u32, f32, u32, f32)>,
+}
+
+/// Extract logits from a [1, vocab] tensor to a Vec<f32> on CPU.
+/// Works for any element type (F32, BF16, etc.) by converting to F32.
+fn extract_logits_f32<B: Backend>(logits: &Tensor<B, 2>) -> Vec<f32> {
+    let data = logits.clone().into_data().convert::<f32>();
+    data.as_slice::<f32>().unwrap().to_vec()
+}
+
+/// Compute L2 norm of a float slice.
+fn l2_norm(v: &[f32]) -> f32 {
+    v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+/// Build a FrameTrace from raw and post-penalty logit vectors.
+fn build_frame_trace(
+    frame_idx: usize,
+    sampled_token: u32,
+    raw_logits: &[f32],
+    post_logits: &[f32],
+    eos_idx: usize,
+    hidden_norm: f32,
+    acoustic_codes: Vec<u32>,
+    code_logits: Vec<(u32, f32, u32, f32)>,
+) -> FrameTrace {
+    // Find top-5 from raw logits
+    let mut indices: Vec<usize> = (0..raw_logits.len()).collect();
+    indices.sort_unstable_by(|&a, &b| raw_logits[b].partial_cmp(&raw_logits[a]).unwrap());
+
+    let mut top5_tokens = [0u32; 5];
+    let mut top5_logits = [f32::NEG_INFINITY; 5];
+    for i in 0..5.min(indices.len()) {
+        top5_tokens[i] = indices[i] as u32;
+        top5_logits[i] = raw_logits[indices[i]];
+    }
+
+    FrameTrace {
+        frame_idx,
+        sampled_token,
+        top5_tokens,
+        top5_logits,
+        eos_logit: if eos_idx < raw_logits.len() {
+            raw_logits[eos_idx]
+        } else {
+            f32::NEG_INFINITY
+        },
+        eos_logit_post: if eos_idx < post_logits.len() {
+            post_logits[eos_idx]
+        } else {
+            f32::NEG_INFINITY
+        },
+        hidden_norm,
+        acoustic_codes,
+        code_logits,
+    }
 }
 
 // ── Streaming session ────────────────────────────────────────────────────

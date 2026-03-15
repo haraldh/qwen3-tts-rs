@@ -289,13 +289,23 @@ impl<B: Backend> Attention<B> {
         let k = self.repeat_kv(k);
         let v = self.repeat_kv(v);
 
-        // Use burn's attention() which dispatches to flash attention on CubeCL backends.
-        let options = burn::tensor::ops::AttentionModuleOptions {
-            scale: None,
-            softcap: None,
-            is_causal,
+        // For single-token decode (seq_q=1), use direct matmul instead of
+        // flash attention. Avoids autotune overhead for trivially small attention.
+        let attn_output = if seq_len == 1 {
+            let scale = (self.head_dim as f64).powf(-0.5);
+            // q: [B, H, 1, D], k: [B, H, S, D] → scores: [B, H, 1, S]
+            let scores = q.matmul(k.swap_dims(2, 3)).mul_scalar(scale);
+            let weights = burn::tensor::activation::softmax(scores, 3);
+            // weights: [B, H, 1, S] @ v: [B, H, S, D] → [B, H, 1, D]
+            weights.matmul(v)
+        } else {
+            let options = burn::tensor::ops::AttentionModuleOptions {
+                scale: None,
+                softcap: None,
+                is_causal,
+            };
+            burn::tensor::module::attention(q, k, v, None, None, options)
         };
-        let attn_output = burn::tensor::module::attention(q, k, v, None, None, options);
 
         // Reshape back: [batch, heads, seq, head_dim] -> [batch, seq, hidden]
         let attn_output =

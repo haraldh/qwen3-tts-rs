@@ -5,6 +5,7 @@
 
 use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
+use burn::tensor::DType;
 
 use super::kv_cache::KVCache;
 use super::transformer::{DecoderLayer, DecoderLayerConfig, RoPEType, RotaryEmbedding};
@@ -214,6 +215,7 @@ impl<B: Backend> CodePredictor<B> {
         // Step 2: Predict first acoustic code from last position (stay on GPU)
         let last_hidden = hidden.narrow(1, seq_len - 1, 1);
         let logits = self.lm_heads[0].forward(last_hidden);
+        let logits = logits.cast(DType::F32); // F32 for precise argmax on BF16 backends
         // argmax(2) on [1,1,V] → [1,1,1]; squeeze to [1,1] for embedding lookup
         let mut prev_code_idx: Tensor<B, 2, Int> = logits.argmax(2).squeeze_dim::<2>(2);
         let mut code_tensors: Vec<Tensor<B, 2, Int>> = vec![prev_code_idx.clone()];
@@ -238,21 +240,105 @@ impl<B: Backend> CodePredictor<B> {
             h = self.norm.forward(h);
 
             let logits = self.lm_heads[group_idx].forward(h);
+            let logits = logits.cast(DType::F32); // F32 for precise argmax on BF16 backends
             prev_code_idx = logits.argmax(2).squeeze_dim::<2>(2);
             code_tensors.push(prev_code_idx.clone());
             offset += 1;
         }
 
-        // Single GPU→CPU sync: read all 15 codes at once
+        // Single GPU→CPU sync: read all 15 codes at once.
+        // Read as i32 directly — going through .float() would convert via BF16
+        // on ROCm, rounding indices >= 2045 to 2048 (BF16 step size is 8 near 2048).
         let all_codes_tensor = Tensor::cat(code_tensors, 1); // [1, 15]
-        let codes_data: Vec<f32> = all_codes_tensor
+        let codes_data: Vec<i32> = all_codes_tensor
             .reshape([num_acoustic as i32])
-            .float()
             .into_data()
-            .convert::<f32>()
+            .convert::<i32>()
             .to_vec()
             .unwrap();
         codes_data.iter().map(|&c| c as u32).collect()
+    }
+
+    /// Generate all 15 acoustic tokens with per-code logit diagnostics.
+    ///
+    /// Returns `(codes, diagnostics)` where diagnostics is a vec of
+    /// `(top1_id, top1_logit, top2_id, top2_logit)` for each code.
+    pub fn generate_acoustic_codes_traced(
+        &self,
+        talker_hidden: Tensor<B, 3>,
+        semantic_embed: Tensor<B, 3>,
+        rope: &RoPEType<B>,
+        cp_kv_caches: &mut [KVCache<B>],
+        _device: &B::Device,
+    ) -> (Vec<u32>, Vec<(u32, f32, u32, f32)>) {
+        for cache in cp_kv_caches.iter_mut() {
+            cache.reset();
+        }
+
+        let num_acoustic = self.num_code_groups - 1;
+
+        let input = Tensor::cat(vec![talker_hidden, semantic_embed], 1);
+        let input = if let Some(proj) = &self.small_to_mtp_projection {
+            proj.forward(input)
+        } else {
+            input
+        };
+        let seq_len = input.dims()[1];
+
+        let mut hidden = input;
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward(hidden, rope, true, Some(&mut cp_kv_caches[i]), 0);
+        }
+        hidden = self.norm.forward(hidden);
+
+        let mut codes = Vec::with_capacity(num_acoustic);
+        let mut diagnostics = Vec::with_capacity(num_acoustic);
+
+        let device = hidden.device();
+
+        // First code
+        let last_hidden = hidden.narrow(1, seq_len - 1, 1);
+        let logits = self.lm_heads[0].forward(last_hidden);
+        let vocab_size = logits.dims()[2];
+        let logits_1d = logits.reshape([vocab_size]); // [V]
+        let (code, diag) = extract_top2_and_argmax::<B>(logits_1d);
+        codes.push(code);
+        diagnostics.push(diag);
+        let mut prev_code_idx: Tensor<B, 2, Int> = Tensor::from_ints(
+            [[code as i32]],
+            &device,
+        );
+
+        // Remaining 14 codes
+        let mut offset = seq_len;
+        for group_idx in 1..num_acoustic {
+            let code_embed = self.codec_embeddings[group_idx - 1].forward(prev_code_idx);
+            let code_embed = if let Some(proj) = &self.small_to_mtp_projection {
+                proj.forward(code_embed)
+            } else {
+                code_embed
+            };
+
+            let mut h = code_embed;
+            for (i, layer) in self.layers.iter().enumerate() {
+                h = layer.forward(h, rope, false, Some(&mut cp_kv_caches[i]), offset);
+            }
+            h = self.norm.forward(h);
+
+            let logits = self.lm_heads[group_idx].forward(h);
+            let logits_1d = logits.reshape([vocab_size]);
+            let (code, diag) = extract_top2_and_argmax::<B>(logits_1d);
+            codes.push(code);
+            diagnostics.push(diag);
+
+            prev_code_idx = Tensor::from_ints(
+                [[code as i32]],
+                &device,
+            );
+            offset += 1;
+        }
+
+        (codes, diagnostics)
     }
 
     /// Get sum of all acoustic code embeddings.
@@ -322,6 +408,35 @@ impl<B: Backend> CodePredictor<B> {
             ..Default::default()
         }
     }
+}
+
+/// Extract argmax code and top-2 logits from a 1-D logits tensor.
+/// Returns `(argmax_code, (top1_id, top1_logit, top2_id, top2_logit))`.
+fn extract_top2_and_argmax<B: Backend>(logits: Tensor<B, 1>) -> (u32, (u32, f32, u32, f32)) {
+    let data = logits.into_data().convert::<f32>();
+    let vals = data.as_slice::<f32>().unwrap();
+
+    let mut top1_idx = 0usize;
+    let mut top1_val = f32::NEG_INFINITY;
+    let mut top2_idx = 0usize;
+    let mut top2_val = f32::NEG_INFINITY;
+
+    for (i, &v) in vals.iter().enumerate() {
+        if v > top1_val {
+            top2_idx = top1_idx;
+            top2_val = top1_val;
+            top1_idx = i;
+            top1_val = v;
+        } else if v > top2_val {
+            top2_idx = i;
+            top2_val = v;
+        }
+    }
+
+    (
+        top1_idx as u32,
+        (top1_idx as u32, top1_val, top2_idx as u32, top2_val),
+    )
 }
 
 #[cfg(test)]

@@ -102,7 +102,8 @@ pub use models::{
 
 // Burn-based re-exports (always available)
 pub use burn_models::facade::{
-    Qwen3TTS, StreamingSession, SynthesisOptions, CODEC_EOS_TOKEN_ID, SAMPLES_PER_FRAME,
+    FrameTrace, Qwen3TTS, StreamingSession, SynthesisOptions, CODEC_EOS_TOKEN_ID,
+    SAMPLES_PER_FRAME,
 };
 pub use burn_models::sampling::{GenerationConfig, SamplingContext};
 
