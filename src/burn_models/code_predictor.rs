@@ -180,6 +180,10 @@ impl<B: Backend> CodePredictor<B> {
     }
 
     /// Generate all 15 acoustic tokens autoregressively.
+    ///
+    /// Returns `(codes, embedding_sum)` where `embedding_sum` is the sum of all 15
+    /// pre-projection codec embeddings `[1, 1, codec_embed_dim]`, ready for residual VQ.
+    /// This avoids the CPU↔GPU round-trip that `get_acoustic_embeddings_sum` would need.
     pub fn generate_acoustic_codes(
         &self,
         talker_hidden: Tensor<B, 3>,
@@ -187,12 +191,13 @@ impl<B: Backend> CodePredictor<B> {
         rope: &RoPEType<B>,
         cp_kv_caches: &mut [KVCache<B>],
         _device: &B::Device,
-    ) -> Vec<u32> {
+    ) -> (Vec<u32>, Tensor<B, 3>) {
         for cache in cp_kv_caches.iter_mut() {
             cache.reset();
         }
 
         let num_acoustic = self.num_code_groups - 1;
+        let device = talker_hidden.device();
 
         // Step 1: Prefill with [talker_hidden, semantic_embed]
         let input = Tensor::cat(vec![talker_hidden, semantic_embed], 1);
@@ -218,12 +223,17 @@ impl<B: Backend> CodePredictor<B> {
         let mut prev_code_idx: Tensor<B, 2, Int> = logits.argmax(2).squeeze_dim::<2>(2);
         let mut code_tensors: Vec<Tensor<B, 2, Int>> = vec![prev_code_idx.clone()];
 
+        // Accumulate pre-projection embeddings for residual VQ
+        let codec_embed_dim = self.codec_embeddings[0].forward(prev_code_idx.clone()).dims()[2];
+        let mut embed_sum = Tensor::<B, 3>::zeros([1, 1, codec_embed_dim], &device);
+
         // Step 3: Autoregressively generate remaining 14 codes (all on GPU)
         let mut offset = seq_len;
         for group_idx in 1..num_acoustic {
             // Use GPU-resident argmax result directly as embedding index
             let code_embed = self.codec_embeddings[group_idx - 1].forward(prev_code_idx);
-            // code_embed is [1, 1, codec_embed_dim]
+            // code_embed is [1, 1, codec_embed_dim] — accumulate before projection
+            embed_sum = embed_sum + code_embed.clone();
 
             let code_embed = if let Some(proj) = &self.small_to_mtp_projection {
                 proj.forward(code_embed)
@@ -243,6 +253,10 @@ impl<B: Backend> CodePredictor<B> {
             offset += 1;
         }
 
+        // Embed the last predicted code (codebook 14) — not covered by the loop
+        let last_embed = self.codec_embeddings[num_acoustic - 1].forward(prev_code_idx);
+        embed_sum = embed_sum + last_embed;
+
         // Single GPU→CPU sync: read all 15 codes at once.
         // Read as i32 directly — going through .float() would convert via BF16
         // on ROCm, rounding indices >= 2045 to 2048 (BF16 step size is 8 near 2048).
@@ -253,7 +267,8 @@ impl<B: Backend> CodePredictor<B> {
             .convert::<i32>()
             .to_vec()
             .unwrap();
-        codes_data.iter().map(|&c| c as u32).collect()
+        let codes = codes_data.iter().map(|&c| c as u32).collect();
+        (codes, embed_sum)
     }
 
     /// Get sum of all acoustic code embeddings.

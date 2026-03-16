@@ -739,13 +739,14 @@ impl<B: Backend> Qwen3TTS<B> {
 
             #[cfg(feature = "profiling")]
             let t = std::time::Instant::now();
-            let acoustic_codes = self.code_predictor.generate_acoustic_codes(
-                last_hidden.clone(),
-                semantic_embed.clone(),
-                &self.cp_rope,
-                &mut cp_kv_caches,
-                &self.device,
-            );
+            let (acoustic_codes, acoustic_embed_sum) =
+                self.code_predictor.generate_acoustic_codes(
+                    last_hidden.clone(),
+                    semantic_embed.clone(),
+                    &self.cp_rope,
+                    &mut cp_kv_caches,
+                    &self.device,
+                );
             #[cfg(feature = "profiling")]
             {
                 t_cp_total += t.elapsed();
@@ -763,9 +764,6 @@ impl<B: Backend> Qwen3TTS<B> {
             // Residual VQ: sum semantic + all acoustic embeddings
             #[cfg(feature = "profiling")]
             let t = std::time::Instant::now();
-            let acoustic_embed_sum = self
-                .code_predictor
-                .get_acoustic_embeddings_sum(&acoustic_codes, &self.device);
             let summed = semantic_embed + acoustic_embed_sum;
 
             // Trailing text fusion
@@ -1218,13 +1216,14 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
                 .get_codec_embedding(token_id, &self.model.device);
 
             // Generate 15 acoustic codes
-            let acoustic_codes = self.model.code_predictor.generate_acoustic_codes(
-                self.last_hidden.clone(),
-                semantic_embed.clone(),
-                &self.model.cp_rope,
-                &mut self.cp_kv_caches,
-                &self.model.device,
-            );
+            let (acoustic_codes, acoustic_embed_sum) =
+                self.model.code_predictor.generate_acoustic_codes(
+                    self.last_hidden.clone(),
+                    semantic_embed.clone(),
+                    &self.model.cp_rope,
+                    &mut self.cp_kv_caches,
+                    &self.model.device,
+                );
 
             // Build frame
             let mut frame = Vec::with_capacity(16);
@@ -1236,10 +1235,6 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
             self.frames_generated += 1;
 
             // Residual VQ sum + trailing text fusion
-            let acoustic_embed_sum = self
-                .model
-                .code_predictor
-                .get_acoustic_embeddings_sum(&acoustic_codes, &self.model.device);
             let summed = semantic_embed + acoustic_embed_sum;
 
             let text_addition = if frame_idx < self.trailing_text_len {
