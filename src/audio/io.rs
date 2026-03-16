@@ -81,6 +81,38 @@ impl AudioBuffer {
         load_wav(path)
     }
 
+    /// Encode this buffer as a complete WAV file in memory.
+    pub fn to_wav_bytes(&self) -> Vec<u8> {
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: self.sample_rate,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = WavWriter::new(&mut cursor, spec).expect("WAV writer creation");
+            for &sample in &self.samples {
+                let clamped = sample.clamp(-1.0, 1.0);
+                let scaled = (clamped * 32767.0) as i16;
+                writer.write_sample(scaled).expect("WAV sample write");
+            }
+            writer.finalize().expect("WAV finalize");
+        }
+        cursor.into_inner()
+    }
+
+    /// Encode samples as raw PCM i16 little-endian bytes (no header).
+    pub fn to_pcm_i16_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.samples.len() * 2);
+        for &sample in &self.samples {
+            let clamped = sample.clamp(-1.0, 1.0);
+            let scaled = (clamped * 32767.0) as i16;
+            bytes.extend_from_slice(&scaled.to_le_bytes());
+        }
+        bytes
+    }
+
     /// Normalize audio to [-1.0, 1.0] range
     pub fn normalize(&mut self) {
         let max_abs = self.samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);

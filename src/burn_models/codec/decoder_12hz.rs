@@ -95,6 +95,30 @@ impl<B: Backend> CausalConv1d<B> {
         }
     }
 
+    /// Create a causal conv with stride (for encoder downsampling).
+    pub fn new_strided(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        dilation: usize,
+        groups: usize,
+        device: &B::Device,
+    ) -> Self {
+        let conv = Conv1dConfig::new(in_channels, out_channels, kernel_size)
+            .with_stride(stride)
+            .with_dilation(dilation)
+            .with_groups(groups)
+            .with_bias(true)
+            .with_padding(burn::nn::PaddingConfig1d::Explicit(0, 0))
+            .init(device);
+        let causal_padding = dilation * (kernel_size - 1);
+        Self {
+            conv,
+            causal_padding,
+        }
+    }
+
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let x_padded = if self.causal_padding > 0 {
             let [batch, channels, _seq_len] = x.dims();

@@ -438,6 +438,88 @@ impl<B: Backend> TalkerModel<B> {
         self.run_prefill_layers(hidden, rope, kv_caches, device)
     }
 
+    /// Build ICL (in-context learning) prompt for voice cloning.
+    ///
+    /// Combines reference text, target text, and reference codec embeddings into
+    /// the ICL input sequence. Uses streaming layout: element-wise overlay of
+    /// text and codec embeddings where they overlap.
+    ///
+    /// # Returns
+    /// `(icl_embed, trailing_text_embed)` — the ICL sequence to process through
+    /// layers, and the trailing text for the generation loop.
+    pub fn build_icl_prompt(
+        &self,
+        target_text_ids: &[u32],
+        ref_text_ids: &[u32],
+        ref_codec_embeds: &Tensor<B, 3>, // [1, T_ref, hidden]
+        device: &B::Device,
+    ) -> (Tensor<B, 3>, Tensor<B, 3>) {
+        use codec_tokens::*;
+
+        // 1. Text embeddings: [ref_text, target_text, tts_eos] projected
+        let mut all_text_ids: Vec<u32> =
+            Vec::with_capacity(ref_text_ids.len() + target_text_ids.len() + 1);
+        all_text_ids.extend_from_slice(ref_text_ids);
+        all_text_ids.extend_from_slice(target_text_ids);
+        all_text_ids.push(tts_tokens::TTS_EOS);
+
+        let text_embed = self.get_projected_text_embeddings(&all_text_ids, device); // [1, N_text, hidden]
+        let n_text = text_embed.dims()[1];
+
+        // 2. Codec embeddings: prepend codec_bos, then ref_codec_embeds
+        let bos_embed = self.get_codec_embedding(CODEC_BOS, device); // [1, 1, hidden]
+        let codec_embed = Tensor::cat(vec![bos_embed, ref_codec_embeds.clone()], 1); // [1, T_ref+1, hidden]
+        let n_codec = codec_embed.dims()[1];
+
+        let tts_pad_embed = self.get_tts_pad_embed(device); // [1, 1, hidden]
+
+        // 3. Streaming layout: element-wise overlay
+        if n_text > n_codec {
+            let text_head = text_embed.clone().narrow(1, 0, n_codec);
+            let icl_embed = text_head + codec_embed;
+            let trailing = text_embed.narrow(1, n_codec, n_text - n_codec);
+            (icl_embed, trailing)
+        } else {
+            let pad_count = n_codec - n_text;
+            let padded_text = if pad_count > 0 {
+                let pad_broadcast = tts_pad_embed
+                    .clone()
+                    .expand([1, pad_count, self.hidden_size]);
+                Tensor::cat(vec![text_embed, pad_broadcast], 1)
+            } else {
+                text_embed
+            };
+            let icl_embed = padded_text + codec_embed;
+            (icl_embed, tts_pad_embed)
+        }
+    }
+
+    /// Run ICL prompt through transformer layers (not using run_prefill_layers
+    /// because ICL starts at a non-zero offset after voice clone prefill).
+    ///
+    /// Returns `(last_hidden_state, logits)` from the final ICL position.
+    pub fn run_icl_layers(
+        &self,
+        icl_embed: Tensor<B, 3>,
+        rope: &RoPEType<B>,
+        kv_caches: &mut [KVCache<B>],
+        offset: usize,
+    ) -> (Tensor<B, 3>, Tensor<B, 3>) {
+        let mut hidden = icl_embed;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward(hidden, rope, true, Some(&mut kv_caches[i]), offset);
+        }
+
+        hidden = self.norm.forward(hidden);
+
+        let icl_len = hidden.dims()[1];
+        let last_hidden = hidden.narrow(1, icl_len - 1, 1);
+        let logits = self.codec_head.forward(last_hidden.clone());
+
+        (last_hidden, logits)
+    }
+
     /// Generate step with pre-built input embedding.
     pub fn generate_step_with_embed(
         &self,

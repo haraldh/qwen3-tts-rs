@@ -15,6 +15,7 @@ use burn::prelude::*;
 
 use super::code_predictor::{CodePredictor, CodePredictorConfig};
 use super::codec::decoder_12hz::{Decoder12Hz, Decoder12HzConfig};
+use super::codec::encoder_12hz::{Encoder12Hz, Encoder12HzConfig};
 use super::speaker::SpeakerEncoder;
 use super::talker::{TalkerConfig, TalkerModel, TextProjection};
 use super::transformer::{
@@ -559,9 +560,10 @@ pub fn load_code_predictor<B: Backend>(
     cp.codec_embeddings = codec_embeddings;
 
     // small_to_mtp_projection (for 1.7B models)
+    // Note: this weight lives under talker.code_predictor., not talker.code_predictor.model.
     if codec_embed_dim != config.hidden_size {
         let proj = load_linear(
-            &cp_model_weights,
+            &cp_weights,
             "small_to_mtp_projection.",
             codec_embed_dim,
             config.hidden_size,
@@ -955,6 +957,232 @@ fn load_residual_unit<B: Backend>(
     Ok(())
 }
 
+/// Load an [`Encoder12Hz`] from a safetensors file (speech_tokenizer/model.safetensors).
+pub fn load_encoder<B: Backend>(
+    safetensors_path: &Path,
+    config: Encoder12HzConfig,
+    device: &B::Device,
+) -> Result<Encoder12Hz<B>> {
+    let all_tensors = load_safetensors_f32(safetensors_path)?;
+    // Strip "encoder." prefix to get component-level keys
+    let enc: HashMap<String, &TensorInfo> = all_tensors
+        .iter()
+        .filter_map(|(k, v)| k.strip_prefix("encoder.").map(|s| (s.to_string(), v)))
+        .collect();
+
+    let mut encoder = Encoder12Hz::<B>::init(config.clone(), device);
+
+    // ── SEANet encoder ──
+
+    // Init conv: encoder.encoder.layers.0
+    load_conv1d_weights(
+        &mut encoder.seanet.init_conv.conv,
+        &enc,
+        "encoder.layers.0.conv.",
+        device,
+    )?;
+
+    // Stages: each has residual blocks + downsample conv
+    // Layer numbering: for stage i, residual blocks start at layer_idx, downsample at layer_idx + n_res + 1
+    // With n_residual_layers=1: layout is [init(0), res(1), elu(2), down(3), res(4), elu(5), down(6), ...]
+    let mut layer_idx = 1; // after init conv
+    for (i, stage) in encoder.seanet.stages.iter_mut().enumerate() {
+        // Residual blocks
+        for (j, block) in stage.residual_blocks.iter_mut().enumerate() {
+            let block_layer = layer_idx + j;
+            let p = format!("encoder.layers.{block_layer}.block.");
+            // block.0 = ELU (no weights), block.1 = dilated conv, block.2 = ELU, block.3 = 1x1 conv
+            load_conv1d_weights(&mut block.conv1.conv, &enc, &format!("{p}1.conv."), device)?;
+            load_conv1d_weights(&mut block.conv2.conv, &enc, &format!("{p}3.conv."), device)?;
+        }
+        layer_idx += config.num_residual_layers;
+
+        // ELU (no weights) — skip
+        layer_idx += 1;
+
+        // Downsample conv
+        let down_layer = layer_idx;
+        load_conv1d_weights(
+            &mut stage.downsample.conv,
+            &enc,
+            &format!("encoder.layers.{down_layer}.conv."),
+            device,
+        )?;
+        layer_idx += 1;
+
+        tracing::trace!("Loaded SEANet encoder stage {i}");
+    }
+
+    // Final ELU (no weights) + final conv
+    layer_idx += 1; // skip ELU
+    load_conv1d_weights(
+        &mut encoder.seanet.final_conv.conv,
+        &enc,
+        &format!("encoder.layers.{layer_idx}.conv."),
+        device,
+    )?;
+
+    // ── Transformer layers ──
+    let hidden = config.hidden_size;
+    let q_dim = config.num_heads * config.head_dim;
+    let intermediate = config.intermediate_size;
+    for i in 0..config.num_transformer_layers {
+        let p = format!("encoder_transformer.layers.{i}.");
+        let layer = &mut encoder.transformer_layers[i];
+
+        layer.input_layernorm =
+            load_layer_norm(&enc, &format!("{p}input_layernorm."), hidden, device)?;
+        layer.q_proj = load_linear(
+            &enc,
+            &format!("{p}self_attn.q_proj."),
+            hidden,
+            q_dim,
+            false,
+            device,
+        )?;
+        layer.k_proj = load_linear(
+            &enc,
+            &format!("{p}self_attn.k_proj."),
+            hidden,
+            q_dim,
+            false,
+            device,
+        )?;
+        layer.v_proj = load_linear(
+            &enc,
+            &format!("{p}self_attn.v_proj."),
+            hidden,
+            q_dim,
+            false,
+            device,
+        )?;
+        layer.o_proj = load_linear(
+            &enc,
+            &format!("{p}self_attn.o_proj."),
+            q_dim,
+            hidden,
+            false,
+            device,
+        )?;
+
+        let attn_scale_key = format!("{p}self_attn_layer_scale.scale");
+        if let Some(info) = enc.get(&attn_scale_key) {
+            layer.attn_layer_scale = make_tensor_1d(info, device);
+        }
+
+        layer.post_attention_layernorm = load_layer_norm(
+            &enc,
+            &format!("{p}post_attention_layernorm."),
+            hidden,
+            device,
+        )?;
+
+        // GELU MLP: fc1 + fc2 (no bias, no gate)
+        layer.fc1 = load_linear(
+            &enc,
+            &format!("{p}mlp.fc1."),
+            hidden,
+            intermediate,
+            false,
+            device,
+        )?;
+        layer.fc2 = load_linear(
+            &enc,
+            &format!("{p}mlp.fc2."),
+            intermediate,
+            hidden,
+            false,
+            device,
+        )?;
+
+        let mlp_scale_key = format!("{p}mlp_layer_scale.scale");
+        if let Some(info) = enc.get(&mlp_scale_key) {
+            layer.mlp_layer_scale = make_tensor_1d(info, device);
+        }
+    }
+
+    // ── Downsample conv ──
+    load_conv1d_weights(
+        &mut encoder.downsample.conv,
+        &enc,
+        "downsample.conv.",
+        device,
+    )?;
+
+    // ── Quantizer ──
+
+    // Semantic RVQ: 1 codebook
+    load_output_proj_from_conv(
+        &mut encoder.quantizer.semantic.input_proj,
+        &enc,
+        "quantizer.semantic_residual_vector_quantizer.input_proj.",
+        device,
+    )?;
+    load_output_proj_from_conv(
+        &mut encoder.quantizer.semantic.output_proj,
+        &enc,
+        "quantizer.semantic_residual_vector_quantizer.output_proj.",
+        device,
+    )?;
+    load_normalized_codebook_for_vq(
+        &mut encoder.quantizer.semantic.layers[0],
+        &enc,
+        "quantizer.semantic_residual_vector_quantizer.layers.0.codebook.",
+        device,
+    )?;
+
+    // Acoustic RVQ: 15 codebooks (layers 0-14 from the safetensors)
+    load_output_proj_from_conv(
+        &mut encoder.quantizer.acoustic.input_proj,
+        &enc,
+        "quantizer.acoustic_residual_vector_quantizer.input_proj.",
+        device,
+    )?;
+    load_output_proj_from_conv(
+        &mut encoder.quantizer.acoustic.output_proj,
+        &enc,
+        "quantizer.acoustic_residual_vector_quantizer.output_proj.",
+        device,
+    )?;
+    for i in 0..config.num_acoustic_quantizers {
+        load_normalized_codebook_for_vq(
+            &mut encoder.quantizer.acoustic.layers[i],
+            &enc,
+            &format!("quantizer.acoustic_residual_vector_quantizer.layers.{i}.codebook."),
+            device,
+        )?;
+    }
+
+    tracing::info!("Loaded encoder (12Hz)");
+    Ok(encoder)
+}
+
+/// Load normalized codebook into a VectorQuantizer.
+fn load_normalized_codebook_for_vq<B: Backend>(
+    vq: &mut super::codec::encoder_12hz::VectorQuantizer<B>,
+    weights: &HashMap<String, &TensorInfo>,
+    prefix: &str,
+    device: &B::Device,
+) -> Result<()> {
+    let sum_key = format!("{prefix}embed_sum");
+    let usage_key = format!("{prefix}cluster_usage");
+
+    let sum_info = weights
+        .get(&sum_key)
+        .with_context(|| format!("Missing codebook embed_sum: {sum_key}"))?;
+    let usage_info = weights
+        .get(&usage_key)
+        .with_context(|| format!("Missing codebook cluster_usage: {usage_key}"))?;
+
+    let embedding_sum = make_tensor_2d::<B>(sum_info, device);
+    let cluster_usage = make_tensor_1d::<B>(usage_info, device);
+    let cluster_usage = cluster_usage.clamp_min(1e-7).unsqueeze_dim::<2>(1);
+    let normalized = embedding_sum / cluster_usage;
+
+    vq.codebook = normalized;
+    Ok(())
+}
+
 /// Load all model components from a model directory.
 ///
 /// Expected directory structure:
@@ -1000,6 +1228,10 @@ pub fn load_all<B: Backend>(model_dir: &Path, device: &B::Device) -> Result<Load
     tracing::info!("Loading decoder (12Hz)...");
     let decoder = load_decoder(&st_path, Decoder12HzConfig::default(), device)?;
 
+    // Load encoder (for ICL voice cloning — all model types have it)
+    tracing::info!("Loading encoder (12Hz)...");
+    let encoder = load_encoder(&st_path, Encoder12HzConfig::default(), device)?;
+
     // Load speaker encoder (Base models only)
     let speaker_encoder = if parsed.speaker_encoder_config.is_some() {
         tracing::warn!(
@@ -1015,6 +1247,7 @@ pub fn load_all<B: Backend>(model_dir: &Path, device: &B::Device) -> Result<Load
         talker,
         code_predictor,
         decoder,
+        encoder,
         speaker_encoder,
         model_type: Some(parsed.model_type),
     })
@@ -1025,6 +1258,7 @@ pub struct LoadedComponents<B: Backend> {
     pub talker: TalkerModel<B>,
     pub code_predictor: CodePredictor<B>,
     pub decoder: Decoder12Hz<B>,
+    pub encoder: Encoder12Hz<B>,
     pub speaker_encoder: Option<SpeakerEncoder<B>>,
     pub model_type: Option<crate::models::config::ModelType>,
 }

@@ -14,7 +14,7 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::Path;
 
-use qwen3_tts::{AudioBuffer, Language, ModelType, Speaker, SynthesisOptions};
+use qwen3_tts::{AudioBuffer, Language, ModelType, Speaker, SynthesisOptions, VoiceClonePrompt};
 
 // ── Backend selection ────────────────────────────────────────────────────
 
@@ -86,6 +86,14 @@ struct Args {
     /// Voice description for VoiceDesign model (e.g. "A cheerful young female voice")
     #[arg(long)]
     instruct: Option<String>,
+
+    /// Reference audio WAV for voice cloning (Base models only)
+    #[arg(long)]
+    ref_audio: Option<String>,
+
+    /// Reference text transcript (enables ICL voice cloning when used with --ref-audio)
+    #[arg(long)]
+    ref_text: Option<String>,
 
     /// Output WAV file path (default: output.wav)
     #[arg(short, long, default_value = "output.wav")]
@@ -159,7 +167,29 @@ fn run(args: &Args) -> Result<()> {
     let options = build_options(args);
 
     // Select synthesis path based on model type and args
-    let audio = if let Some(ref instruct) = args.instruct {
+    let audio = if let Some(ref ref_audio_path) = args.ref_audio {
+        // Voice cloning: Base models with reference audio
+        let is_icl = args.ref_text.is_some();
+        println!(
+            "Mode: VoiceClone ({})",
+            if is_icl { "ICL" } else { "x_vector_only" }
+        );
+        let ref_audio = AudioBuffer::load(ref_audio_path)?;
+        println!(
+            "Reference audio: {:.2}s ({} samples, {}Hz)",
+            ref_audio.duration(),
+            ref_audio.len(),
+            ref_audio.sample_rate
+        );
+
+        let prompt = model.create_voice_clone_prompt(&ref_audio, args.ref_text.as_deref())?;
+
+        if args.streaming {
+            synthesize_voice_clone_streaming(&model, &args.text, &prompt, language, options)?
+        } else {
+            model.synthesize_voice_clone(&args.text, &prompt, language, Some(options))?
+        }
+    } else if let Some(ref instruct) = args.instruct {
         // VoiceDesign: text-described voice
         println!("Mode: VoiceDesign");
         println!("Instruct: {}", instruct);
@@ -218,6 +248,38 @@ fn synthesize_streaming(
 ) -> Result<AudioBuffer> {
     let chunk_frames = options.chunk_frames;
     let mut session = model.synthesize_streaming(text, speaker, language, options)?;
+
+    let mut all_samples = Vec::new();
+    let mut chunk_count = 0;
+    while let Some(chunk) = session.next_chunk()? {
+        all_samples.extend_from_slice(&chunk.samples);
+        chunk_count += 1;
+        eprintln!(
+            "  Chunk {}: {} frames, {:.2}s total",
+            chunk_count,
+            chunk_frames,
+            all_samples.len() as f64 / 24000.0
+        );
+    }
+    eprintln!(
+        "  Streaming complete: {} chunks, {} frames",
+        chunk_count,
+        session.frames_generated()
+    );
+
+    Ok(AudioBuffer::new(all_samples, 24000))
+}
+
+/// Streaming voice clone synthesis with progress output.
+fn synthesize_voice_clone_streaming(
+    model: &qwen3_tts::Qwen3TTS<SelectedBackend>,
+    text: &str,
+    prompt: &VoiceClonePrompt<SelectedBackend>,
+    language: Language,
+    options: SynthesisOptions,
+) -> Result<AudioBuffer> {
+    let chunk_frames = options.chunk_frames;
+    let mut session = model.synthesize_voice_clone_streaming(text, prompt, language, options)?;
 
     let mut all_samples = Vec::new();
     let mut chunk_count = 0;
