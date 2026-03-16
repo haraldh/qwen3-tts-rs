@@ -117,6 +117,12 @@ impl Default for GenerationConfig {
 
 /// Sample next token from logits.
 ///
+/// Performs temperature scaling, top-k filtering, and softmax on GPU,
+/// then transfers only the top-k values and indices to CPU for
+/// multinomial sampling. This avoids a full `[1, vocab_size]` GPU→CPU sync.
+///
+/// Falls back to full CPU sampling when top-k is disabled or top-p is active.
+///
 /// # Arguments
 /// * `logits` - Logits tensor of shape [batch, vocab_size]
 /// * `config` - Generation configuration
@@ -129,12 +135,61 @@ pub fn sample<B: Backend>(
     config: &GenerationConfig,
     ctx: &mut SamplingContext,
 ) -> u32 {
-    // Transfer to CPU for sampling (sampling is a tiny operation)
-    let [batch, vocab] = logits.dims();
+    let [batch, _vocab] = logits.dims();
     assert_eq!(batch, 1, "Only batch=1 supported for sampling");
 
+    // Very low temperature → greedy (GPU argmax, single int transfer)
+    if config.temperature < 0.01 {
+        return logits.argmax(1).into_scalar().elem::<i32>() as u32;
+    }
+
+    // GPU-side top-k path: when top-k is enabled and top-p is not
+    if config.top_k > 0 && (config.top_p >= 1.0 || config.top_p <= 0.0) {
+        return sample_topk_gpu(logits, config, ctx);
+    }
+
+    // Fallback: full CPU sampling (needed for top-p or no top-k)
+    sample_cpu(logits, config, ctx)
+}
+
+/// GPU-side top-k sampling: temperature, top-k, softmax on GPU, small transfer to CPU.
+fn sample_topk_gpu<B: Backend>(
+    logits: Tensor<B, 2>,
+    config: &GenerationConfig,
+    ctx: &mut SamplingContext,
+) -> u32 {
+    // Temperature scaling on GPU
+    let logits = if config.temperature != 1.0 && config.temperature > 0.0 {
+        logits.div_scalar(config.temperature)
+    } else {
+        logits
+    };
+
+    // Top-k on GPU: sort descending, take top k values + indices
+    let k = config.top_k;
+    let (top_values, top_indices) = logits.topk_with_indices(k, 1);
+
+    // Softmax over top-k values on GPU, then transfer to CPU
+    let probs = burn::tensor::activation::softmax(top_values, 1);
+
+    // Transfer only k probs + k indices to CPU (e.g. 20*2 = 160 bytes vs 12KB)
+    let probs_vec: Vec<f32> = probs.into_data().convert::<f32>().to_vec().unwrap();
+    let indices_vec: Vec<i32> = top_indices.into_data().convert::<i32>().to_vec().unwrap();
+
+    // Multinomial sample from the small probability vector
+    let sampled_pos = multinomial_sample_vec(&probs_vec, ctx);
+    indices_vec[sampled_pos as usize] as u32
+}
+
+/// Full CPU sampling fallback (for top-p or when top-k is disabled).
+fn sample_cpu<B: Backend>(
+    logits: Tensor<B, 2>,
+    config: &GenerationConfig,
+    ctx: &mut SamplingContext,
+) -> u32 {
+    let [_batch, vocab] = logits.dims();
+
     let mut logits_vec: Vec<f32> = logits.into_data().convert::<f32>().to_vec().unwrap();
-    // Only use the first batch
     logits_vec.truncate(vocab);
 
     // Apply temperature
@@ -143,11 +198,6 @@ pub fn sample<B: Backend>(
         for v in &mut logits_vec {
             *v *= inv_temp;
         }
-    }
-
-    // Very low temperature → greedy
-    if config.temperature < 0.01 {
-        return argmax_vec(&logits_vec) as u32;
     }
 
     // Apply top-k filtering
