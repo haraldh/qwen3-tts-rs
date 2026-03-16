@@ -24,17 +24,15 @@ use super::tts::{self, SuppressionMask};
 /// The codec end-of-sequence token ID (2150).
 pub const CODEC_EOS_TOKEN_ID: u32 = codec_tokens::CODEC_EOS;
 
-/// Set a single position in a Bool tensor to `true` via scatter.
+/// Set a single position in a Bool tensor to `true`.
 fn set_penalty_bit<B: Backend>(
     mask: &Tensor<B, 1, Bool>,
     idx: usize,
     device: &B::Device,
 ) -> Tensor<B, 1, Bool> {
+    let true_val = Tensor::<B, 1, Bool>::from_data([true], device);
     #[allow(clippy::single_range_in_vec_init)]
-    let one_hot = Tensor::<B, 1, Int>::zeros([mask.dims()[0]], device)
-        .slice_assign([idx..idx + 1], Tensor::<B, 1, Int>::ones([1], device))
-        .equal_elem(1);
-    mask.clone().bool_or(one_hot)
+    mask.clone().slice_assign([idx..idx + 1], true_val)
 }
 
 /// Number of audio samples per codec frame at 24kHz (1920 = 80ms at 12Hz).

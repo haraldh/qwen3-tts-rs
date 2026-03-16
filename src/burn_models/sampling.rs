@@ -188,27 +188,23 @@ pub fn apply_repetition_penalty_with_mask<B: Backend>(
     }
 
     let [batch, vocab] = logits.dims();
-    let device = logits.device();
     let mask_2d = penalty_mask
         .clone()
         .unsqueeze_dim::<2>(0)
         .expand([batch, vocab]);
 
-    // For tokens in mask: positive logits get divided by penalty, negative get multiplied.
-    // Equivalent: logits * where(mask && logits > 0, 1/penalty, where(mask && logits < 0, penalty, 1.0))
+    // For masked tokens: positive logits ÷ penalty, negative logits × penalty.
+    // sign_factor = where(logits > 0, 1/penalty, penalty), then apply only where masked.
     let penalty_val = penalty as f32;
     let inv_penalty = 1.0 / penalty_val;
 
-    let ones = Tensor::<B, 2>::ones([batch, vocab], &device);
-    let pos_factors = Tensor::<B, 2>::full([batch, vocab], inv_penalty, &device);
-    let neg_factors = Tensor::<B, 2>::full([batch, vocab], penalty_val, &device);
-
-    // positive logits: factor = 1/penalty; negative logits: factor = penalty
     let positive = logits.clone().greater_elem(0.0);
-    let factors = neg_factors.mask_where(positive, pos_factors);
+    let sign_factor = positive.float().mul_scalar(inv_penalty - penalty_val).add_scalar(penalty_val);
+    // where(positive, inv_penalty, penalty_val) = positive * (inv_penalty - penalty_val) + penalty_val
 
-    // Only apply to masked positions; unmasked positions get factor=1.0
-    let factors = ones.mask_where(mask_2d, factors);
+    // Only apply to masked positions; unmasked get factor=1.0
+    let factors = mask_2d.float().mul(sign_factor.sub_scalar(1.0)).add_scalar(1.0);
+    // where(mask, sign_factor, 1.0) = mask * (sign_factor - 1.0) + 1.0
 
     logits * factors
 }
