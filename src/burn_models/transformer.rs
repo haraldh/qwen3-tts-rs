@@ -114,25 +114,44 @@ impl<B: Backend> RotaryEmbedding<B> {
 ///
 /// For TTS, all 3 position dimensions use the same value, so this is
 /// equivalent to standard RoPE but preserves the frequency interleaving.
+///
+/// Pre-computes cos/sin tables up to `max_seq_len` (like `RotaryEmbedding`)
+/// to avoid per-layer matmul + cos() + sin() kernel launches every frame.
 pub struct MRoPE<B: Backend> {
-    inv_freq: Tensor<B, 1>,
-    device: B::Device,
+    cos: Tensor<B, 2>,
+    sin: Tensor<B, 2>,
 }
 
 impl<B: Backend> MRoPE<B> {
-    pub fn new(dim: usize, theta: f64, _mrope_section: [usize; 3], device: &B::Device) -> Self {
-        // Store inv_freq in F32 to preserve precision for on-the-fly cos/sin computation.
-        // Matches PyTorch's Qwen2RotaryEmbedding which keeps inv_freq in F32.
+    pub fn new(
+        dim: usize,
+        theta: f64,
+        _mrope_section: [usize; 3],
+        max_seq_len: usize,
+        device: &B::Device,
+    ) -> Self {
         let inv_freq: Vec<f32> = (0..dim)
             .step_by(2)
             .map(|i| 1.0 / (theta as f32).powf(i as f32 / dim as f32))
             .collect();
-        let inv_freq = Tensor::<B, 1>::from_floats(inv_freq.as_slice(), device).cast(DType::F32);
+        let half_dim = inv_freq.len();
 
-        Self {
-            inv_freq,
-            device: device.clone(),
-        }
+        // Compute cos/sin in F32, then cast to backend dtype for storage.
+        let native_dtype = Tensor::<B, 1>::zeros([1], device).dtype();
+        let inv_freq = Tensor::<B, 1>::from_floats(inv_freq.as_slice(), device).cast(DType::F32);
+        let positions: Vec<f32> = (0..max_seq_len).map(|i| i as f32).collect();
+        let positions = Tensor::<B, 1>::from_floats(positions.as_slice(), device)
+            .cast(DType::F32)
+            .unsqueeze_dim::<2>(1);
+
+        // [max_seq_len, 1] @ [1, half_dim] -> [max_seq_len, half_dim]
+        let freqs = positions.matmul(inv_freq.unsqueeze_dim::<2>(0));
+        let cos = freqs.clone().cos().cast(native_dtype);
+        let sin = freqs.sin().cast(native_dtype);
+
+        debug_assert_eq!(cos.dims(), [max_seq_len, half_dim]);
+
+        Self { cos, sin }
     }
 
     pub fn apply(
@@ -142,17 +161,8 @@ impl<B: Backend> MRoPE<B> {
         offset: usize,
         seq_len: usize,
     ) -> (Tensor<B, 4>, Tensor<B, 4>) {
-        let positions: Vec<f32> = (offset..offset + seq_len).map(|i| i as f32).collect();
-        let pos = Tensor::<B, 1>::from_floats(positions.as_slice(), &self.device).cast(DType::F32);
-
-        let pos_col = pos.unsqueeze_dim::<2>(1); // [seq_len, 1]
-        let inv_freq_row = self.inv_freq.clone().unsqueeze_dim::<2>(0); // [1, half_dim]
-        let freqs = pos_col.matmul(inv_freq_row); // [seq_len, half_dim]
-
-        // Compute cos/sin in F32, cast to Q/K dtype (matching PyTorch)
-        let q_dtype = q.dtype();
-        let cos = freqs.clone().cos().cast(q_dtype);
-        let sin = freqs.sin().cast(q_dtype);
+        let cos = self.cos.clone().narrow(0, offset, seq_len);
+        let sin = self.sin.clone().narrow(0, offset, seq_len);
 
         let q_rot = apply_rope_rotation(q, cos.clone(), sin.clone());
         let k_rot = apply_rope_rotation(k, cos, sin);

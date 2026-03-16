@@ -166,6 +166,7 @@ impl<B: Backend> TalkerModel<B> {
                 self.head_dim,
                 self.rope_theta,
                 mrope_section,
+                self.max_position_embeddings,
                 device,
             ))
         } else {
