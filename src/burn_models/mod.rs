@@ -22,3 +22,6 @@ pub mod talker;
 pub mod transformer;
 pub mod tts;
 pub mod weight_loader;
+
+#[cfg(feature = "rocm")]
+pub mod hip;

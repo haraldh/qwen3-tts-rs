@@ -8,7 +8,7 @@ autobenches = false
 
 [features]
 default = ["cpu"]
-cpu = ["burn/ndarray"]
+cpu = ["burn/ndarray", "burn/cpu"]
 cli = ["clap", "indicatif"]
 serve = ["cli", "dep:axum", "dep:tokio", "dep:tokio-stream", "dep:tower-http"]
 hub = ["hf-hub"]
@@ -20,18 +20,18 @@ all-portable = ["cpu", "cli", "hub"]
 
 # Platform-specific — enable manually based on your hardware:
 #   macOS:         wgpu (Vulkan/Metal via CubeCL)
-#   Linux + Intel: cpu (with openblas if desired)
+#   Linux + Intel: cpu
 #   Linux + NVIDIA: cuda
 #   Linux + AMD:   rocm
 cuda = ["burn/cuda"]
-rocm = ["burn/rocm"]
+rocm = ["burn/rocm", "dep:cubecl-hip-sys"]
 wgpu = ["burn/wgpu"]
 vulkan = ["wgpu", "burn/vulkan"]
 profiling = ["dep:tracing-chrome"]
 
 [dependencies]
 # Burn ML framework (replaces Candle)
-burn = { path = "/home/harald/git/burn/crates/burn", default-features = false }
+burn = { path = "/home/harald/git/qwen3-tts-rs/burn/crates/burn", default-features = false }
 half = "2.7"
 safetensors = "0.4"
 
@@ -65,8 +65,13 @@ indicatif = { version = "0.18", optional = true }
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
 audioadapter-buffers = "2.0.0"
 
+# HIP runtime bindings for raw GPU kernel bypass (optional, rocm only)
+cubecl-hip-sys = { version = "7.2.5321000", optional = true }
+
 # Profiling (optional)
 tracing-chrome = { version = "0.7", optional = true }
+
+
 
 # HTTP server (optional, for serve feature)
 axum = { version = "0.8", optional = true }
@@ -120,20 +125,20 @@ lto = false
 
 # Override cubecl crates to use local builds (must match burn's local cubecl)
 [patch.crates-io]
-cubecl = { path = "/home/harald/git/cubecl/crates/cubecl" }
-cubecl-common = { path = "/home/harald/git/cubecl/crates/cubecl-common" }
-cubecl-core = { path = "/home/harald/git/cubecl/crates/cubecl-core" }
-cubecl-cpp = { path = "/home/harald/git/cubecl/crates/cubecl-cpp" }
-cubecl-cpu = { path = "/home/harald/git/cubecl/crates/cubecl-cpu" }
-cubecl-cuda = { path = "/home/harald/git/cubecl/crates/cubecl-cuda" }
-cubecl-hip = { path = "/home/harald/git/cubecl/crates/cubecl-hip" }
-cubecl-ir = { path = "/home/harald/git/cubecl/crates/cubecl-ir" }
-cubecl-macros = { path = "/home/harald/git/cubecl/crates/cubecl-macros" }
-cubecl-macros-internal = { path = "/home/harald/git/cubecl/crates/cubecl-macros-internal" }
-cubecl-opt = { path = "/home/harald/git/cubecl/crates/cubecl-opt" }
-cubecl-runtime = { path = "/home/harald/git/cubecl/crates/cubecl-runtime" }
-cubecl-spirv = { path = "/home/harald/git/cubecl/crates/cubecl-spirv" }
-cubecl-std = { path = "/home/harald/git/cubecl/crates/cubecl-std" }
-cubecl-wgpu = { path = "/home/harald/git/cubecl/crates/cubecl-wgpu" }
-cubecl-zspace = { path = "/home/harald/git/cubecl/crates/cubecl-zspace" }
-cubecl-hip-sys = { path = "/home/harald/git/cubecl-hip-sys/crates/cubecl-hip-sys" }
+cubecl = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl" }
+cubecl-common = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-common" }
+cubecl-core = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-core" }
+cubecl-cpp = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-cpp" }
+cubecl-cpu = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-cpu" }
+cubecl-cuda = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-cuda" }
+cubecl-hip = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-hip" }
+cubecl-ir = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-ir" }
+cubecl-macros = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-macros" }
+cubecl-macros-internal = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-macros-internal" }
+cubecl-opt = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-opt" }
+cubecl-runtime = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-runtime" }
+cubecl-spirv = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-spirv" }
+cubecl-std = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-std" }
+cubecl-wgpu = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-wgpu" }
+cubecl-zspace = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-zspace" }
+cubecl-hip-sys = { path = "/home/harald/git/qwen3-tts-rs/cubecl-hip-sys/crates/cubecl-hip-sys" }

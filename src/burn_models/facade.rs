@@ -132,6 +132,9 @@ pub struct Qwen3TTS<B: Backend> {
     cp_rope: RoPEType<B>,
     model_type: Option<ModelType>,
     device: B::Device,
+    /// Raw HIP code predictor bypass (ROCm only).
+    #[cfg(feature = "rocm")]
+    hip_cp: Option<super::hip::code_predictor::HipCodePredictor>,
 }
 
 impl<B: Backend> Qwen3TTS<B> {
@@ -170,7 +173,7 @@ impl<B: Backend> Qwen3TTS<B> {
         // Load all model components
         let components = super::weight_loader::load_all(model_path, &device)?;
 
-        Ok(Self::build_from_components(
+        let tts = Self::build_from_components(
             components.talker,
             components.code_predictor,
             components.decoder,
@@ -179,10 +182,13 @@ impl<B: Backend> Qwen3TTS<B> {
             components.speaker_encoder,
             components.model_type,
             device,
-        ))
+        );
+
+        Ok(tts)
     }
 
     /// Build from pre-constructed model components.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_from_components(
         talker: TalkerModel<B>,
         code_predictor: CodePredictor<B>,
@@ -195,6 +201,25 @@ impl<B: Backend> Qwen3TTS<B> {
     ) -> Self {
         let rope = talker.create_rope(&device);
         let cp_rope = code_predictor.create_rope(&device);
+
+        #[cfg(feature = "rocm")]
+        let hip_cp = {
+            let (cos_data, sin_data) = cp_rope.cos_sin_data();
+            let config = code_predictor.config();
+            match super::hip::code_predictor::HipCodePredictor::from_burn(
+                &code_predictor,
+                config,
+                &cos_data,
+                &sin_data,
+            ) {
+                Ok(cp) => Some(cp),
+                Err(e) => {
+                    tracing::warn!("HIP code predictor init failed, using Burn fallback: {e}");
+                    None
+                }
+            }
+        };
+
         Self {
             talker,
             code_predictor,
@@ -206,6 +231,8 @@ impl<B: Backend> Qwen3TTS<B> {
             cp_rope,
             model_type,
             device,
+            #[cfg(feature = "rocm")]
+            hip_cp,
         }
     }
 
@@ -738,12 +765,10 @@ impl<B: Backend> Qwen3TTS<B> {
             #[cfg(feature = "profiling")]
             let t = std::time::Instant::now();
             let (acoustic_codes, acoustic_embed_sum) =
-                self.code_predictor.generate_acoustic_codes(
+                self.run_code_predictor(
                     last_hidden.clone(),
                     semantic_embed.clone(),
-                    &self.cp_rope,
                     &mut cp_kv_caches,
-                    &self.device,
                 );
             #[cfg(feature = "profiling")]
             {
@@ -851,6 +876,38 @@ impl<B: Backend> Qwen3TTS<B> {
         }
 
         all_codes
+    }
+
+    /// Run code predictor, using HIP bypass on ROCm when available.
+    fn run_code_predictor(
+        &self,
+        last_hidden: Tensor<B, 3>,
+        semantic_embed: Tensor<B, 3>,
+        cp_kv_caches: &mut [KVCache<B>],
+    ) -> (Vec<u32>, Tensor<B, 3>) {
+        #[cfg(feature = "rocm")]
+        {
+            if let Some(hip_cp) = &self.hip_cp {
+                let th = last_hidden.into_data();
+                let se = semantic_embed.into_data();
+                let dtype = th.dtype;
+                let (hip_codes, embed_bytes) = hip_cp.generate(th.as_bytes(), se.as_bytes());
+
+                let dim = self.code_predictor.config().codec_embed_dim();
+                let embed_sum = Tensor::from_data(
+                    TensorData::from_bytes_vec(embed_bytes, [1, 1, dim], dtype),
+                    &self.device,
+                );
+                return (hip_codes, embed_sum);
+            }
+        }
+        self.code_predictor.generate_acoustic_codes(
+            last_hidden,
+            semantic_embed,
+            &self.cp_rope,
+            cp_kv_caches,
+            &self.device,
+        )
     }
 
     /// Apply repetition penalty, token suppression, and min_new_tokens EOS mask.
@@ -1215,12 +1272,10 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
 
             // Generate 15 acoustic codes
             let (acoustic_codes, acoustic_embed_sum) =
-                self.model.code_predictor.generate_acoustic_codes(
+                self.model.run_code_predictor(
                     self.last_hidden.clone(),
                     semantic_embed.clone(),
-                    &self.model.cp_rope,
                     &mut self.cp_kv_caches,
-                    &self.model.device,
                 );
 
             // Build frame

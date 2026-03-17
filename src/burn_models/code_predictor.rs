@@ -98,11 +98,15 @@ pub struct CodePredictor<B: Backend> {
     head_dim: usize,
     #[module(skip)]
     rope_theta: f64,
+    /// Full config for HIP code predictor init.
+    #[module(skip)]
+    full_config: CodePredictorConfig,
 }
 
 impl<B: Backend> CodePredictor<B> {
     /// Initialize from config.
     pub fn init(config: CodePredictorConfig, device: &B::Device) -> Self {
+        let full_config = config.clone();
         let num_acoustic_groups = config.num_code_groups - 1;
         let codec_embed_dim = config.codec_embed_dim();
 
@@ -156,6 +160,7 @@ impl<B: Backend> CodePredictor<B> {
             num_key_value_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
             rope_theta: config.rope_theta,
+            full_config,
         }
     }
 
@@ -332,16 +337,9 @@ impl<B: Backend> CodePredictor<B> {
         self.codec_embeddings[group_idx].forward(codes.unsqueeze::<2>())
     }
 
-    /// Reconstruct config.
-    pub fn config(&self) -> CodePredictorConfig {
-        CodePredictorConfig {
-            hidden_size: self.hidden_size,
-            num_hidden_layers: self.num_hidden_layers,
-            num_code_groups: self.num_code_groups,
-            head_dim: self.head_dim,
-            rope_theta: self.rope_theta,
-            ..Default::default()
-        }
+    /// Get the full configuration.
+    pub fn config(&self) -> &CodePredictorConfig {
+        &self.full_config
     }
 }
 
