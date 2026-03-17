@@ -25,6 +25,18 @@
         };
 
         rocmPkgs = pkgs.rocmPackages;
+
+        # openblas-src crate probes pkg-config for "openblas", but NixOS
+        # ships blas.pc instead. This derivation creates a proper openblas.pc.
+        openblasLib = pkgs.openblas;
+        openblasDev = pkgs.openblas.dev;
+        openblasPkgConfig = pkgs.writeTextDir "lib/pkgconfig/openblas.pc" ''
+          Name: openblas
+          Description: OpenBLAS (NixOS wrapper for openblas-src crate)
+          Version: ${pkgs.openblas.version}
+          Libs: -L${openblasLib}/lib -lopenblas
+          Cflags: -I${openblasDev}/include
+        '';
       in
       {
         devShells.default = pkgs.mkShell {
@@ -54,6 +66,9 @@
             rocmPkgs.hipblas
             rocmPkgs.hipsparse
             rocmPkgs.miopen
+            rocmPackages.rocm-smi
+            rocmPkgs.rocprofiler    # rocprof CLI for kernel tracing
+            rocmPkgs.roctracer      # HIP/HSA tracing (rocprofiler dependency)
 
             # Vulkan
             vulkan-loader
@@ -64,6 +79,8 @@
             # System libs
             openssl
             alsa-lib
+            openblas.dev         # Multi-threaded BLAS for CPU code predictor
+            openblasPkgConfig    # pkg-config wrapper so openblas-src can find it
           ];
 
           shellHook = ''

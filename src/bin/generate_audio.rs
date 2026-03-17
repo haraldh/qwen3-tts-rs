@@ -167,6 +167,7 @@ fn run(args: &Args) -> Result<()> {
     let options = build_options(args);
 
     // Select synthesis path based on model type and args
+    let gen_start = std::time::Instant::now();
     let audio = if let Some(ref ref_audio_path) = args.ref_audio {
         // Voice cloning: Base models with reference audio
         let is_icl = args.ref_text.is_some();
@@ -219,9 +220,14 @@ fn run(args: &Args) -> Result<()> {
         }
     };
 
+    let gen_elapsed = gen_start.elapsed();
+    let audio_dur = audio.duration() as f64;
+    let rtf = gen_elapsed.as_secs_f64() / audio_dur;
     println!(
-        "\nGenerated: {:.2}s, {} samples",
-        audio.duration(),
+        "\nGenerated: {:.2}s audio in {:.2}s (RTF: {:.2}), {} samples",
+        audio_dur,
+        gen_elapsed.as_secs_f64(),
+        rtf,
         audio.len()
     );
 

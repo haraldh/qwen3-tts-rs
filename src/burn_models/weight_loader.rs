@@ -1262,3 +1262,21 @@ pub struct LoadedComponents<B: Backend> {
     pub speaker_encoder: Option<SpeakerEncoder<B>>,
     pub model_type: Option<crate::models::config::ModelType>,
 }
+
+/// Load a [`CodePredictor`] on the NdArray (CPU) backend from a model directory.
+///
+/// Used for running the code predictor on CPU when the main backend is a GPU,
+/// avoiding kernel launch overhead on tiny seq_len=1 operations.
+#[cfg(feature = "cpu")]
+pub fn load_cpu_code_predictor(
+    model_dir: &Path,
+) -> Result<CodePredictor<burn::backend::NdArray>> {
+    let config_path = model_dir.join("config.json");
+    let model_path = model_dir.join("model.safetensors");
+    let parsed =
+        ParsedModelConfig::from_file(&config_path).context("Failed to parse config.json")?;
+    let cp_config = CodePredictorConfig::from_parsed(&parsed);
+    let device = Default::default();
+    load_code_predictor(&model_path, cp_config, &device)
+}
+

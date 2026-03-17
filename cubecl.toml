@@ -1,2 +1,6 @@
 [compilation]
 cache = "target"
+
+[debug]
+# Disable all CubeCL debugging for benchmarks
+enabled = false
