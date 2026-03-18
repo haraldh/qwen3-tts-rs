@@ -85,6 +85,10 @@ struct Args {
     /// Default max frames to generate (default: 2048, ~164s)
     #[arg(long, default_value_t = 2048)]
     max_frames: usize,
+
+    /// Use streaming synthesis (per-chunk decode; may have boundary artifacts)
+    #[arg(long)]
+    streaming: bool,
 }
 
 // ── Audio format ─────────────────────────────────────────────────────────
@@ -122,6 +126,7 @@ struct SynthesisRequest {
     language: Language,
     options: SynthesisOptions,
     format: AudioFormat,
+    streaming: bool,
     response_tx: tokio_mpsc::Sender<Result<Vec<u8>, String>>,
 }
 
@@ -199,6 +204,7 @@ struct AppState {
     command_tx: std_mpsc::SyncSender<SynthesisRequest>,
     default_language: Language,
     default_options: SynthesisOptions,
+    streaming: bool,
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────
@@ -297,6 +303,7 @@ async fn speech_handler(State(state): State<AppState>, Json(req): Json<SpeechReq
         language,
         options,
         format,
+        streaming: state.streaming,
         response_tx,
     };
 
@@ -338,22 +345,30 @@ fn process_request(
     model: &qwen3_tts::Qwen3TTS<SelectedBackend>,
     req: &SynthesisRequest,
 ) -> Result<(), String> {
-    // Use non-streaming synthesis: collect all codes, decode once.
-    // The decoder (ConvNeXt + transformer) has causal convolutions that need full
-    // context — decoding chunks independently produces discontinuities at boundaries.
     eprintln!(
-        "Synthesizing: speaker={:?} lang={:?} text={:?}",
-        req.speaker, req.language, &req.text
+        "Synthesizing: speaker={:?} lang={:?} streaming={} text={:?}",
+        req.speaker, req.language, req.streaming, &req.text
     );
     let t0 = std::time::Instant::now();
-    let audio = model
-        .synthesize_with_voice(
-            &req.text,
-            req.speaker,
-            req.language,
-            Some(req.options.clone()),
-        )
-        .map_err(|e| e.to_string())?;
+    let audio = if req.streaming {
+        let mut session = model
+            .synthesize_streaming(&req.text, req.speaker, req.language, req.options.clone())
+            .map_err(|e| e.to_string())?;
+        let mut all_samples = Vec::new();
+        while let Some(chunk) = session.next_chunk().map_err(|e| e.to_string())? {
+            all_samples.extend_from_slice(&chunk.samples);
+        }
+        qwen3_tts::AudioBuffer::new(all_samples, 24000)
+    } else {
+        model
+            .synthesize_with_voice(
+                &req.text,
+                req.speaker,
+                req.language,
+                Some(req.options.clone()),
+            )
+            .map_err(|e| e.to_string())?
+    };
     let elapsed = t0.elapsed();
 
     let duration = audio.duration();
@@ -424,6 +439,7 @@ fn main() -> Result<()> {
         command_tx,
         default_language,
         default_options,
+        streaming: args.streaming,
     };
 
     let app = Router::new()
