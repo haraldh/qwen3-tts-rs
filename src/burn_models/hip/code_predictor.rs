@@ -5,6 +5,7 @@
 //! per-frame kernel launches from ~7071 to ~1200, cutting code predictor
 //! time from ~107ms to ~15-20ms.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 
 use burn::prelude::*;
@@ -38,7 +39,8 @@ struct LayerWeights {
 /// loop with direct HIP kernel launches (no CubeCL overhead).
 pub struct HipCodePredictor {
     kernels: HipKernels,
-    stream: hipStream_t,
+    own_stream: hipStream_t,
+    active_stream: Cell<hipStream_t>,
 
     layers: Vec<LayerWeights>,
     final_norm: *mut c_void,
@@ -104,7 +106,10 @@ impl HipCodePredictor {
         let kernels = HipKernels::compile()?;
 
         let mut stream: hipStream_t = std::ptr::null_mut();
-        hip_check(unsafe { cubecl_hip_sys::hipStreamCreate(&mut stream) }, "hipStreamCreate")?;
+        hip_check(
+            unsafe { cubecl_hip_sys::hipStreamCreate(&mut stream) },
+            "hipStreamCreate",
+        )?;
 
         let hidden_size = config.hidden_size;
         let intermediate_size = config.intermediate_size;
@@ -128,13 +133,41 @@ impl HipCodePredictor {
             let a = &la.self_attn;
             let m = &la.mlp;
             layers.push(LayerWeights {
-                q_weight: ga.upload_transposed(&a.q_proj.weight.val().into_data(), hidden_size, q_dim),
-                k_weight: ga.upload_transposed(&a.k_proj.weight.val().into_data(), hidden_size, kv_dim),
-                v_weight: ga.upload_transposed(&a.v_proj.weight.val().into_data(), hidden_size, kv_dim),
-                o_weight: ga.upload_transposed(&a.o_proj.weight.val().into_data(), q_dim, hidden_size),
-                gate_weight: ga.upload_transposed(&m.gate_proj.weight.val().into_data(), hidden_size, intermediate_size),
-                up_weight: ga.upload_transposed(&m.up_proj.weight.val().into_data(), hidden_size, intermediate_size),
-                down_weight: ga.upload_transposed(&m.down_proj.weight.val().into_data(), intermediate_size, hidden_size),
+                q_weight: ga.upload_transposed(
+                    &a.q_proj.weight.val().into_data(),
+                    hidden_size,
+                    q_dim,
+                ),
+                k_weight: ga.upload_transposed(
+                    &a.k_proj.weight.val().into_data(),
+                    hidden_size,
+                    kv_dim,
+                ),
+                v_weight: ga.upload_transposed(
+                    &a.v_proj.weight.val().into_data(),
+                    hidden_size,
+                    kv_dim,
+                ),
+                o_weight: ga.upload_transposed(
+                    &a.o_proj.weight.val().into_data(),
+                    q_dim,
+                    hidden_size,
+                ),
+                gate_weight: ga.upload_transposed(
+                    &m.gate_proj.weight.val().into_data(),
+                    hidden_size,
+                    intermediate_size,
+                ),
+                up_weight: ga.upload_transposed(
+                    &m.up_proj.weight.val().into_data(),
+                    hidden_size,
+                    intermediate_size,
+                ),
+                down_weight: ga.upload_transposed(
+                    &m.down_proj.weight.val().into_data(),
+                    intermediate_size,
+                    hidden_size,
+                ),
                 input_ln: ga.upload(&la.input_layernorm.gamma.val().into_data()),
                 post_ln: ga.upload(&la.post_attention_layernorm.gamma.val().into_data()),
                 q_norm: ga.upload(&a.q_norm.gamma.val().into_data()),
@@ -149,17 +182,23 @@ impl HipCodePredictor {
             .collect();
         // LM heads: Linear [hidden_size, vocab_size] → transposed to [vocab_size, hidden_size]
         let lm_heads: Vec<_> = (0..num_acoustic)
-            .map(|i| ga.upload_transposed(&cp.lm_heads[i].weight.val().into_data(), hidden_size, vocab_size))
+            .map(|i| {
+                ga.upload_transposed(
+                    &cp.lm_heads[i].weight.val().into_data(),
+                    hidden_size,
+                    vocab_size,
+                )
+            })
             .collect();
 
         // MTP projection: Linear [codec_embed_dim, hidden_size] → transposed
-        let mtp_weight = cp
+        let mtp_weight = cp.small_to_mtp_projection.as_ref().map(|p| {
+            ga.upload_transposed(&p.weight.val().into_data(), codec_embed_dim, hidden_size)
+        });
+        let mtp_bias = cp
             .small_to_mtp_projection
             .as_ref()
-            .map(|p| ga.upload_transposed(&p.weight.val().into_data(), codec_embed_dim, hidden_size));
-        let mtp_bias = cp.small_to_mtp_projection.as_ref().and_then(|p| {
-            p.bias.as_ref().map(|b| ga.upload(&b.val().into_data()))
-        });
+            .and_then(|p| p.bias.as_ref().map(|b| ga.upload(&b.val().into_data())));
 
         let cos_table = ga.upload(cos_data);
         let sin_table = ga.upload(sin_data);
@@ -195,7 +234,8 @@ impl HipCodePredictor {
 
         Ok(Self {
             kernels,
-            stream,
+            own_stream: stream,
+            active_stream: Cell::new(stream),
             layers,
             final_norm,
             codec_embeds,
@@ -275,8 +315,14 @@ impl HipCodePredictor {
 
             // Project or copy embedding to input_buf
             if let (Some(w), Some(b)) = (self.mtp_weight, self.mtp_bias) {
-                self.launch_gemv(w, self.projected_buf, self.input_buf,
-                    self.hidden_size, self.codec_embed_dim, b);
+                self.launch_gemv(
+                    w,
+                    self.projected_buf,
+                    self.input_buf,
+                    self.hidden_size,
+                    self.codec_embed_dim,
+                    b,
+                );
             } else {
                 self.d2d_copy(self.projected_buf, self.input_buf, self.hidden_size * 2);
             }
@@ -296,7 +342,7 @@ impl HipCodePredictor {
         );
 
         // Sync and read results
-        unsafe { cubecl_hip_sys::hipStreamSynchronize(self.stream) };
+        unsafe { cubecl_hip_sys::hipStreamSynchronize(self.active_stream.get()) };
 
         let mut codes_i32 = vec![0i32; self.num_acoustic];
         hip_d2h(
@@ -320,8 +366,14 @@ impl HipCodePredictor {
     fn upload_input(&self, data: &[u8]) {
         if let (Some(w), Some(b)) = (self.mtp_weight, self.mtp_bias) {
             hip_h2d(self.projected_buf, data.as_ptr() as *const _, data.len());
-            self.launch_gemv(w, self.projected_buf, self.input_buf,
-                self.hidden_size, self.codec_embed_dim, b);
+            self.launch_gemv(
+                w,
+                self.projected_buf,
+                self.input_buf,
+                self.hidden_size,
+                self.codec_embed_dim,
+                b,
+            );
         } else {
             hip_h2d(self.input_buf, data.as_ptr() as *const _, data.len());
         }
@@ -358,9 +410,30 @@ impl HipCodePredictor {
             self.launch_rmsnorm(self.input_buf, lw.input_ln, self.normed_buf, hs, eps);
 
             // QKV projections
-            self.launch_gemv(lw.q_weight, self.normed_buf, self.q_buf, q_dim, hs, std::ptr::null_mut());
-            self.launch_gemv(lw.k_weight, self.normed_buf, self.k_buf, kv_dim, hs, std::ptr::null_mut());
-            self.launch_gemv(lw.v_weight, self.normed_buf, self.v_buf, kv_dim, hs, std::ptr::null_mut());
+            self.launch_gemv(
+                lw.q_weight,
+                self.normed_buf,
+                self.q_buf,
+                q_dim,
+                hs,
+                std::ptr::null_mut(),
+            );
+            self.launch_gemv(
+                lw.k_weight,
+                self.normed_buf,
+                self.k_buf,
+                kv_dim,
+                hs,
+                std::ptr::null_mut(),
+            );
+            self.launch_gemv(
+                lw.v_weight,
+                self.normed_buf,
+                self.v_buf,
+                kv_dim,
+                hs,
+                std::ptr::null_mut(),
+            );
 
             // QK norm + RoPE
             self.launch_qk_norm_rope(lw.q_norm, lw.k_norm, offset);
@@ -372,7 +445,14 @@ impl HipCodePredictor {
             self.launch_attention_decode(l, offset + 1);
 
             // O projection
-            self.launch_gemv(lw.o_weight, self.attn_out_buf, self.projected_buf, hs, q_dim, std::ptr::null_mut());
+            self.launch_gemv(
+                lw.o_weight,
+                self.attn_out_buf,
+                self.projected_buf,
+                hs,
+                q_dim,
+                std::ptr::null_mut(),
+            );
 
             // Residual: input_buf += projected_buf
             self.launch_add_inplace(self.input_buf, self.projected_buf, hs);
@@ -381,10 +461,31 @@ impl HipCodePredictor {
             self.launch_rmsnorm(self.input_buf, lw.post_ln, self.normed_buf, hs, eps);
 
             // MLP
-            self.launch_gemv(lw.gate_weight, self.normed_buf, self.gate_buf, inter, hs, std::ptr::null_mut());
-            self.launch_gemv(lw.up_weight, self.normed_buf, self.up_buf, inter, hs, std::ptr::null_mut());
+            self.launch_gemv(
+                lw.gate_weight,
+                self.normed_buf,
+                self.gate_buf,
+                inter,
+                hs,
+                std::ptr::null_mut(),
+            );
+            self.launch_gemv(
+                lw.up_weight,
+                self.normed_buf,
+                self.up_buf,
+                inter,
+                hs,
+                std::ptr::null_mut(),
+            );
             self.launch_silu_mul(inter);
-            self.launch_gemv(lw.down_weight, self.mlp_buf, self.projected_buf, hs, inter, std::ptr::null_mut());
+            self.launch_gemv(
+                lw.down_weight,
+                self.mlp_buf,
+                self.projected_buf,
+                hs,
+                inter,
+                std::ptr::null_mut(),
+            );
 
             // Residual: input_buf += projected_buf
             self.launch_add_inplace(self.input_buf, self.projected_buf, hs);
@@ -479,8 +580,12 @@ impl HipCodePredictor {
         ];
         self.launch_kernel(
             self.kernels.qk_norm_rope,
-            total_blocks, 1, 1,
-            128, 1, 1,
+            total_blocks,
+            1,
+            1,
+            128,
+            1,
+            1,
             smem as u32,
             &mut args,
         );
@@ -509,7 +614,17 @@ impl HipCodePredictor {
             ptr_of(&mut hd),
             ptr_of(&mut off),
         ];
-        self.launch_kernel(self.kernels.kv_cache_append, blocks, 1, 1, 256, 1, 1, 0, &mut args);
+        self.launch_kernel(
+            self.kernels.kv_cache_append,
+            blocks,
+            1,
+            1,
+            256,
+            1,
+            1,
+            0,
+            &mut args,
+        );
     }
 
     fn launch_attention_decode(&self, layer: usize, seq_kv: usize) {
@@ -538,8 +653,12 @@ impl HipCodePredictor {
         ];
         self.launch_kernel(
             self.kernels.attention_decode,
-            self.num_heads as u32, 1, 1,
-            128, 1, 1,
+            self.num_heads as u32,
+            1,
+            1,
+            128,
+            1,
+            1,
             0,
             &mut args,
         );
@@ -565,23 +684,26 @@ impl HipCodePredictor {
         let mut p_y = y;
         let mut p_x = x;
         let mut n_i32 = n as i32;
-        let mut args: [*mut c_void; 3] = [
-            ptr_of(&mut p_y),
-            ptr_of(&mut p_x),
-            ptr_of(&mut n_i32),
-        ];
-        self.launch_kernel(self.kernels.add_inplace, blocks, 1, 1, 256, 1, 1, 0, &mut args);
+        let mut args: [*mut c_void; 3] = [ptr_of(&mut p_y), ptr_of(&mut p_x), ptr_of(&mut n_i32)];
+        self.launch_kernel(
+            self.kernels.add_inplace,
+            blocks,
+            1,
+            1,
+            256,
+            1,
+            1,
+            0,
+            &mut args,
+        );
     }
 
     fn launch_argmax(&self, input: *mut c_void, result: *mut c_void, n: usize) {
         let mut p_in = input;
         let mut p_res = result;
         let mut n_i32 = n as i32;
-        let mut args: [*mut c_void; 3] = [
-            ptr_of(&mut p_in),
-            ptr_of(&mut p_res),
-            ptr_of(&mut n_i32),
-        ];
+        let mut args: [*mut c_void; 3] =
+            [ptr_of(&mut p_in), ptr_of(&mut p_res), ptr_of(&mut n_i32)];
         self.launch_kernel(self.kernels.argmax, 1, 1, 1, 256, 1, 1, 0, &mut args);
     }
 
@@ -606,7 +728,17 @@ impl HipCodePredictor {
             ptr_of(&mut p_o),
             ptr_of(&mut d_i32),
         ];
-        self.launch_kernel(self.kernels.embedding_gather_add, blocks, 1, 1, 256, 1, 1, 0, &mut args);
+        self.launch_kernel(
+            self.kernels.embedding_gather_add,
+            blocks,
+            1,
+            1,
+            256,
+            1,
+            1,
+            0,
+            &mut args,
+        );
     }
 
     fn d2d_copy(&self, src: *mut c_void, dst: *mut c_void, size: usize) {
@@ -616,7 +748,7 @@ impl HipCodePredictor {
                 src,
                 size,
                 hipMemcpyKind_hipMemcpyDeviceToDevice,
-                self.stream,
+                self.active_stream.get(),
             );
         }
     }
@@ -624,29 +756,170 @@ impl HipCodePredictor {
     fn launch_kernel(
         &self,
         func: hipFunction_t,
-        gx: u32, gy: u32, gz: u32,
-        bx: u32, by: u32, bz: u32,
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        bx: u32,
+        by: u32,
+        bz: u32,
         smem: u32,
         args: &mut [*mut c_void],
     ) {
         let status = unsafe {
             cubecl_hip_sys::hipModuleLaunchKernel(
-                func, gx, gy, gz, bx, by, bz, smem, self.stream,
+                func,
+                gx,
+                gy,
+                gz,
+                bx,
+                by,
+                bz,
+                smem,
+                self.active_stream.get(),
                 args.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         };
         debug_assert_eq!(status, HIP_SUCCESS, "Kernel launch failed: {status}");
     }
+
+    // ==================== GPU-to-GPU interface ====================
+
+    /// Generate acoustic codes from GPU-resident inputs.
+    ///
+    /// Uses the provided stream for all kernel launches. Does NOT synchronize.
+    /// After return, codes are in `codes_out_buf` and embed sum in `embed_sum_buf`.
+    pub fn generate_gpu_to_gpu(
+        &self,
+        stream: hipStream_t,
+        hidden_ptr: *mut c_void,
+        semantic_ptr: *mut c_void,
+    ) {
+        let _guard = StreamGuard::new(&self.active_stream, stream);
+
+        // Zero embed_sum (async on active stream)
+        unsafe {
+            cubecl_hip_sys::hipMemsetAsync(
+                self.embed_sum_buf,
+                0,
+                self.codec_embed_dim * 2,
+                self.active_stream.get(),
+            );
+        }
+
+        // Prefill: hidden (offset=0), semantic (offset=1)
+        self.upload_input_from_gpu(hidden_ptr);
+        self.forward_one_token(0);
+
+        self.upload_input_from_gpu(semantic_ptr);
+        self.forward_one_token(1);
+
+        // First acoustic code
+        self.run_lm_head(0);
+
+        // Autoregressive decode: groups 1..14
+        for group_idx in 1..self.num_acoustic {
+            self.launch_embedding_gather_add(
+                self.codec_embeds[group_idx - 1],
+                self.code_idx_buf,
+                self.embed_sum_buf,
+                self.projected_buf,
+                self.codec_embed_dim,
+            );
+
+            if let (Some(w), Some(b)) = (self.mtp_weight, self.mtp_bias) {
+                self.launch_gemv(
+                    w,
+                    self.projected_buf,
+                    self.input_buf,
+                    self.hidden_size,
+                    self.codec_embed_dim,
+                    b,
+                );
+            } else {
+                self.d2d_copy(self.projected_buf, self.input_buf, self.hidden_size * 2);
+            }
+
+            let offset = 2 + group_idx - 1;
+            self.forward_one_token(offset);
+            self.run_lm_head(group_idx);
+        }
+
+        // Embed final code for embed_sum
+        self.launch_embedding_gather_add(
+            self.codec_embeds[self.num_acoustic - 1],
+            self.code_idx_buf,
+            self.embed_sum_buf,
+            self.gate_buf, // dummy output
+            self.codec_embed_dim,
+        );
+        // No sync — caller is responsible
+    }
+
+    /// Upload input from a GPU pointer (d2d copy with optional MTP projection).
+    fn upload_input_from_gpu(&self, src_ptr: *mut c_void) {
+        if let (Some(w), Some(b)) = (self.mtp_weight, self.mtp_bias) {
+            self.d2d_copy(src_ptr, self.projected_buf, self.codec_embed_dim * 2);
+            self.launch_gemv(
+                w,
+                self.projected_buf,
+                self.input_buf,
+                self.hidden_size,
+                self.codec_embed_dim,
+                b,
+            );
+        } else {
+            self.d2d_copy(src_ptr, self.input_buf, self.hidden_size * 2);
+        }
+    }
+
+    // ==================== Accessors for frame loop ====================
+
+    pub(crate) fn embed_sum_ptr(&self) -> *mut c_void {
+        self.embed_sum_buf
+    }
+    pub(crate) fn codes_out_ptr(&self) -> *mut c_void {
+        self.codes_out_buf
+    }
+    pub(crate) fn num_acoustic(&self) -> usize {
+        self.num_acoustic
+    }
+    pub(crate) fn kernel_add_inplace(&self) -> hipFunction_t {
+        self.kernels.add_inplace
+    }
+    pub(crate) fn kernel_embedding_gather_add(&self) -> hipFunction_t {
+        self.kernels.embedding_gather_add
+    }
 }
 
 impl Drop for HipCodePredictor {
     fn drop(&mut self) {
-        unsafe { cubecl_hip_sys::hipStreamSynchronize(self.stream) };
+        unsafe { cubecl_hip_sys::hipStreamSynchronize(self.own_stream) };
         for ptr in &self.all_allocs {
             unsafe { cubecl_hip_sys::hipFree(*ptr) };
         }
-        unsafe { cubecl_hip_sys::hipStreamDestroy(self.stream) };
+        unsafe { cubecl_hip_sys::hipStreamDestroy(self.own_stream) };
+    }
+}
+
+/// RAII guard that temporarily sets a Cell<hipStream_t> to a new value
+/// and restores the original on drop (even on panic).
+pub(crate) struct StreamGuard<'a> {
+    cell: &'a Cell<hipStream_t>,
+    original: hipStream_t,
+}
+
+impl<'a> StreamGuard<'a> {
+    pub(crate) fn new(cell: &'a Cell<hipStream_t>, new_stream: hipStream_t) -> Self {
+        let original = cell.get();
+        cell.set(new_stream);
+        Self { cell, original }
+    }
+}
+
+impl Drop for StreamGuard<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.original);
     }
 }
 
@@ -677,12 +950,20 @@ pub(crate) fn hip_malloc(size: usize) -> *mut c_void {
 }
 
 pub(crate) fn hip_h2d(dst: *mut c_void, src: *const c_void, size: usize) {
-    let s = unsafe { cubecl_hip_sys::hipMemcpy(dst, src, size, hipMemcpyKind_hipMemcpyHostToDevice) };
+    let s =
+        unsafe { cubecl_hip_sys::hipMemcpy(dst, src, size, hipMemcpyKind_hipMemcpyHostToDevice) };
     assert_eq!(s, HIP_SUCCESS, "hipMemcpy H2D failed: {s}");
 }
 
 pub(crate) fn hip_d2h(dst: *mut c_void, src: *mut c_void, size: usize) {
-    let s = unsafe { cubecl_hip_sys::hipMemcpy(dst, src as *const _, size, hipMemcpyKind_hipMemcpyDeviceToHost) };
+    let s = unsafe {
+        cubecl_hip_sys::hipMemcpy(
+            dst,
+            src as *const _,
+            size,
+            hipMemcpyKind_hipMemcpyDeviceToHost,
+        )
+    };
     assert_eq!(s, HIP_SUCCESS, "hipMemcpy D2H failed: {s}");
 }
 
@@ -694,7 +975,10 @@ pub(crate) struct GpuAlloc {
 
 impl GpuAlloc {
     pub(crate) fn new() -> Self {
-        Self { ptrs: Vec::new(), total_bytes: 0 }
+        Self {
+            ptrs: Vec::new(),
+            total_bytes: 0,
+        }
     }
 
     pub(crate) fn upload(&mut self, data: &TensorData) -> *mut c_void {
@@ -709,7 +993,12 @@ impl GpuAlloc {
     /// Upload a 2D weight matrix, transposing from [rows, cols] to [cols, rows].
     /// Burn stores Linear weights as [d_input, d_output] but our gemv kernel
     /// expects [d_output, d_input] for coalesced reads.
-    pub(crate) fn upload_transposed(&mut self, data: &TensorData, rows: usize, cols: usize) -> *mut c_void {
+    pub(crate) fn upload_transposed(
+        &mut self,
+        data: &TensorData,
+        rows: usize,
+        cols: usize,
+    ) -> *mut c_void {
         let bytes = data.as_bytes();
         assert_eq!(bytes.len(), rows * cols * 2, "Weight size mismatch");
         self.total_bytes += bytes.len();

@@ -4,10 +4,11 @@
 //! GPU buffers and KV caches, and launches custom HIP kernels directly.
 //! Prefill still runs through Burn; only the per-frame decode step uses HIP.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 
 use burn::prelude::*;
-use cubecl_hip_sys::{hipStream_t, HIP_SUCCESS};
+use cubecl_hip_sys::{hipMemcpyKind_hipMemcpyDeviceToDevice, hipStream_t, HIP_SUCCESS};
 
 use super::kernels::HipKernels;
 use crate::burn_models::kv_cache::KVCache;
@@ -15,7 +16,7 @@ use crate::burn_models::talker::TalkerModel;
 use crate::burn_models::transformer::RoPEType;
 
 // Reuse helpers from code_predictor module
-use super::code_predictor::{div_ceil, hip_check, hip_d2h, hip_h2d, ptr_of, GpuAlloc};
+use super::code_predictor::{div_ceil, hip_check, hip_d2h, hip_h2d, ptr_of, GpuAlloc, StreamGuard};
 
 /// Per-layer weight pointers (all on GPU, BF16).
 struct LayerWeights {
@@ -38,7 +39,8 @@ struct LayerWeights {
 /// Subsequent decode steps (one per frame) run entirely through HIP kernels.
 pub struct HipTalker {
     kernels: HipKernels,
-    stream: hipStream_t,
+    own_stream: hipStream_t,
+    active_stream: Cell<hipStream_t>,
 
     layers: Vec<LayerWeights>,
     final_norm: *mut c_void,
@@ -203,7 +205,8 @@ impl HipTalker {
 
         Ok(Self {
             kernels,
-            stream,
+            own_stream: stream,
+            active_stream: Cell::new(stream),
             layers,
             final_norm,
             codec_head_weight,
@@ -269,8 +272,10 @@ impl HipTalker {
                 let dst_off = h * head_stride_dst;
                 let copy_size = head_stride_src;
 
-                let k_dst = unsafe { (self.k_caches[layer] as *mut u8).add(dst_off) as *mut c_void };
-                let v_dst = unsafe { (self.v_caches[layer] as *mut u8).add(dst_off) as *mut c_void };
+                let k_dst =
+                    unsafe { (self.k_caches[layer] as *mut u8).add(dst_off) as *mut c_void };
+                let v_dst =
+                    unsafe { (self.v_caches[layer] as *mut u8).add(dst_off) as *mut c_void };
 
                 hip_h2d(
                     k_dst,
@@ -289,11 +294,7 @@ impl HipTalker {
     /// Run one decode step: input → 28 layers → norm → codec_head → logits.
     ///
     /// Takes BF16 bytes of shape [hidden_size], returns (last_hidden_bytes, logits_bytes).
-    pub fn forward_decode(
-        &self,
-        input_bytes: &[u8],
-        offset: usize,
-    ) -> (Vec<u8>, Vec<u8>) {
+    pub fn forward_decode(&self, input_bytes: &[u8], offset: usize) -> (Vec<u8>, Vec<u8>) {
         // Upload input
         hip_h2d(
             self.input_buf,
@@ -315,7 +316,7 @@ impl HipTalker {
         );
 
         // Sync and read results
-        unsafe { cubecl_hip_sys::hipStreamSynchronize(self.stream) };
+        unsafe { cubecl_hip_sys::hipStreamSynchronize(self.active_stream.get()) };
 
         // Read last_hidden from input_buf (after all residual additions)
         let mut hidden_bytes = vec![0u8; self.hidden_size * 2];
@@ -350,9 +351,30 @@ impl HipTalker {
             self.launch_rmsnorm(self.input_buf, lw.input_ln, self.normed_buf, hs, eps);
 
             // QKV projections
-            self.launch_gemv(lw.q_weight, self.normed_buf, self.q_buf, q_dim, hs, std::ptr::null_mut());
-            self.launch_gemv(lw.k_weight, self.normed_buf, self.k_buf, kv_dim, hs, std::ptr::null_mut());
-            self.launch_gemv(lw.v_weight, self.normed_buf, self.v_buf, kv_dim, hs, std::ptr::null_mut());
+            self.launch_gemv(
+                lw.q_weight,
+                self.normed_buf,
+                self.q_buf,
+                q_dim,
+                hs,
+                std::ptr::null_mut(),
+            );
+            self.launch_gemv(
+                lw.k_weight,
+                self.normed_buf,
+                self.k_buf,
+                kv_dim,
+                hs,
+                std::ptr::null_mut(),
+            );
+            self.launch_gemv(
+                lw.v_weight,
+                self.normed_buf,
+                self.v_buf,
+                kv_dim,
+                hs,
+                std::ptr::null_mut(),
+            );
 
             // QK norm + RoPE
             self.launch_qk_norm_rope(lw.q_norm, lw.k_norm, offset);
@@ -364,7 +386,14 @@ impl HipTalker {
             self.launch_attention_decode_long(l, offset + 1);
 
             // O projection
-            self.launch_gemv(lw.o_weight, self.attn_out_buf, self.projected_buf, hs, q_dim, std::ptr::null_mut());
+            self.launch_gemv(
+                lw.o_weight,
+                self.attn_out_buf,
+                self.projected_buf,
+                hs,
+                q_dim,
+                std::ptr::null_mut(),
+            );
 
             // Residual: input_buf += projected_buf
             self.launch_add_inplace(self.input_buf, self.projected_buf, hs);
@@ -373,10 +402,31 @@ impl HipTalker {
             self.launch_rmsnorm(self.input_buf, lw.post_ln, self.normed_buf, hs, eps);
 
             // MLP
-            self.launch_gemv(lw.gate_weight, self.normed_buf, self.gate_buf, inter, hs, std::ptr::null_mut());
-            self.launch_gemv(lw.up_weight, self.normed_buf, self.up_buf, inter, hs, std::ptr::null_mut());
+            self.launch_gemv(
+                lw.gate_weight,
+                self.normed_buf,
+                self.gate_buf,
+                inter,
+                hs,
+                std::ptr::null_mut(),
+            );
+            self.launch_gemv(
+                lw.up_weight,
+                self.normed_buf,
+                self.up_buf,
+                inter,
+                hs,
+                std::ptr::null_mut(),
+            );
             self.launch_silu_mul(inter);
-            self.launch_gemv(lw.down_weight, self.mlp_buf, self.projected_buf, hs, inter, std::ptr::null_mut());
+            self.launch_gemv(
+                lw.down_weight,
+                self.mlp_buf,
+                self.projected_buf,
+                hs,
+                inter,
+                std::ptr::null_mut(),
+            );
 
             // Residual: input_buf += projected_buf
             self.launch_add_inplace(self.input_buf, self.projected_buf, hs);
@@ -437,12 +487,7 @@ impl HipTalker {
         self.launch_kernel(self.kernels.rmsnorm, 1, 1, 1, 256, 1, 1, 0, &mut args);
     }
 
-    fn launch_qk_norm_rope(
-        &self,
-        q_norm_w: *mut c_void,
-        k_norm_w: *mut c_void,
-        position: usize,
-    ) {
+    fn launch_qk_norm_rope(&self, q_norm_w: *mut c_void, k_norm_w: *mut c_void, position: usize) {
         let total_blocks = (self.num_heads + self.num_kv_heads) as u32;
         let smem = (128 + self.head_dim) * 4; // reduce + normed floats
 
@@ -572,17 +617,7 @@ impl HipTalker {
             ptr_of(&mut p_out),
             ptr_of(&mut n_i32),
         ];
-        self.launch_kernel(
-            self.kernels.silu_mul,
-            blocks,
-            1,
-            1,
-            256,
-            1,
-            1,
-            0,
-            &mut args,
-        );
+        self.launch_kernel(self.kernels.silu_mul, blocks, 1, 1, 256, 1, 1, 0, &mut args);
     }
 
     fn launch_add_inplace(&self, y: *mut c_void, x: *mut c_void, n: usize) {
@@ -590,11 +625,7 @@ impl HipTalker {
         let mut p_y = y;
         let mut p_x = x;
         let mut n_i32 = n as i32;
-        let mut args: [*mut c_void; 3] = [
-            ptr_of(&mut p_y),
-            ptr_of(&mut p_x),
-            ptr_of(&mut n_i32),
-        ];
+        let mut args: [*mut c_void; 3] = [ptr_of(&mut p_y), ptr_of(&mut p_x), ptr_of(&mut n_i32)];
         self.launch_kernel(
             self.kernels.add_inplace,
             blocks,
@@ -606,6 +637,18 @@ impl HipTalker {
             0,
             &mut args,
         );
+    }
+
+    fn d2d_copy(&self, src: *mut c_void, dst: *mut c_void, size: usize) {
+        unsafe {
+            cubecl_hip_sys::hipMemcpyAsync(
+                dst,
+                src,
+                size,
+                hipMemcpyKind_hipMemcpyDeviceToDevice,
+                self.active_stream.get(),
+            );
+        }
     }
 
     fn launch_kernel(
@@ -622,21 +665,79 @@ impl HipTalker {
     ) {
         let status = unsafe {
             cubecl_hip_sys::hipModuleLaunchKernel(
-                func, gx, gy, gz, bx, by, bz, smem, self.stream,
+                func,
+                gx,
+                gy,
+                gz,
+                bx,
+                by,
+                bz,
+                smem,
+                self.active_stream.get(),
                 args.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
         };
         debug_assert_eq!(status, HIP_SUCCESS, "Kernel launch failed: {status}");
     }
+
+    // ==================== GPU-to-GPU interface ====================
+
+    /// Run one decode step from GPU-resident input.
+    ///
+    /// Copies input from `input_ptr` to internal buffer, runs all layers + codec_head.
+    /// After return, last hidden is in `input_buf`, logits in `logits_buf`.
+    /// Does NOT synchronize.
+    pub fn forward_decode_gpu_to_gpu(
+        &self,
+        stream: hipStream_t,
+        input_ptr: *mut c_void,
+        offset: usize,
+    ) {
+        let _guard = StreamGuard::new(&self.active_stream, stream);
+
+        // Copy input to input_buf (async d2d)
+        self.d2d_copy(input_ptr, self.input_buf, self.hidden_size * 2);
+
+        // Run all layers
+        self.forward_one_token(offset);
+
+        // codec_head: normed_buf → logits_buf
+        self.launch_gemv(
+            self.codec_head_weight,
+            self.normed_buf,
+            self.logits_buf,
+            self.codec_vocab_size,
+            self.hidden_size,
+            std::ptr::null_mut(),
+        );
+        // No sync — caller is responsible
+    }
+
+    // ==================== Accessors for frame loop ====================
+
+    pub(crate) fn input_ptr(&self) -> *mut c_void {
+        self.input_buf
+    }
+    pub(crate) fn logits_ptr(&self) -> *mut c_void {
+        self.logits_buf
+    }
+    #[allow(dead_code)]
+    pub(crate) fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+    #[allow(dead_code)]
+    pub(crate) fn codec_vocab_size(&self) -> usize {
+        self.codec_vocab_size
+    }
 }
 
 impl Drop for HipTalker {
     fn drop(&mut self) {
-        unsafe { cubecl_hip_sys::hipStreamSynchronize(self.stream) };
+        unsafe { cubecl_hip_sys::hipStreamSynchronize(self.own_stream) };
         for ptr in &self.all_allocs {
             unsafe { cubecl_hip_sys::hipFree(*ptr) };
         }
-        unsafe { cubecl_hip_sys::hipStreamDestroy(self.stream) };
+        unsafe { cubecl_hip_sys::hipStreamDestroy(self.own_stream) };
     }
 }

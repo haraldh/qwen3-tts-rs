@@ -181,14 +181,12 @@ impl<B: Backend> RoPEType<B> {
     #[cfg(feature = "rocm")]
     pub(crate) fn cos_sin_data(&self) -> (burn::tensor::TensorData, burn::tensor::TensorData) {
         match self {
-            RoPEType::Standard(rope) => (
-                rope.cos.clone().into_data(),
-                rope.sin.clone().into_data(),
-            ),
-            RoPEType::Multimodal(mrope) => (
-                mrope.cos.clone().into_data(),
-                mrope.sin.clone().into_data(),
-            ),
+            RoPEType::Standard(rope) => {
+                (rope.cos.clone().into_data(), rope.sin.clone().into_data())
+            }
+            RoPEType::Multimodal(mrope) => {
+                (mrope.cos.clone().into_data(), mrope.sin.clone().into_data())
+            }
         }
     }
 

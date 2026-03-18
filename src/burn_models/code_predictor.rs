@@ -229,7 +229,9 @@ impl<B: Backend> CodePredictor<B> {
         let mut code_tensors: Vec<Tensor<B, 2, Int>> = vec![prev_code_idx.clone()];
 
         // Accumulate pre-projection embeddings for residual VQ
-        let codec_embed_dim = self.codec_embeddings[0].forward(prev_code_idx.clone()).dims()[2];
+        let codec_embed_dim = self.codec_embeddings[0]
+            .forward(prev_code_idx.clone())
+            .dims()[2];
         let mut embed_sum = Tensor::<B, 3>::zeros([1, 1, codec_embed_dim], &device);
 
         // Step 3: Autoregressively generate remaining 14 codes (all on GPU)

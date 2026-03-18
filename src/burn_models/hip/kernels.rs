@@ -501,9 +501,8 @@ impl HipKernels {
         let get_fn = |name: &str| -> Result<hipFunction_t, String> {
             let cname = CString::new(name).unwrap();
             let mut func: hipFunction_t = std::ptr::null_mut();
-            let s = unsafe {
-                cubecl_hip_sys::hipModuleGetFunction(&mut func, module, cname.as_ptr())
-            };
+            let s =
+                unsafe { cubecl_hip_sys::hipModuleGetFunction(&mut func, module, cname.as_ptr()) };
             if s != HIP_SUCCESS {
                 return Err(format!("hipModuleGetFunction({name}) failed: {s}"));
             }
@@ -541,7 +540,8 @@ fn get_compile_log(program: hiprtcProgram) -> String {
         return String::from("<no log>");
     }
     let mut log = vec![0u8; log_size];
-    let s = unsafe { cubecl_hip_sys::hiprtcGetProgramLog(program, log.as_mut_ptr() as *mut c_char) };
+    let s =
+        unsafe { cubecl_hip_sys::hiprtcGetProgramLog(program, log.as_mut_ptr() as *mut c_char) };
     if s != hiprtcResult_HIPRTC_SUCCESS {
         return String::from("<log fetch failed>");
     }

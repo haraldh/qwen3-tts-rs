@@ -347,7 +347,12 @@ fn process_request(
     );
     let t0 = std::time::Instant::now();
     let audio = model
-        .synthesize_with_voice(&req.text, req.speaker, req.language, Some(req.options.clone()))
+        .synthesize_with_voice(
+            &req.text,
+            req.speaker,
+            req.language,
+            Some(req.options.clone()),
+        )
         .map_err(|e| e.to_string())?;
     let elapsed = t0.elapsed();
 

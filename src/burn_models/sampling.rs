@@ -249,11 +249,17 @@ pub fn apply_repetition_penalty_with_mask<B: Backend>(
     let inv_penalty = 1.0 / penalty_val;
 
     let positive = logits.clone().greater_elem(0.0);
-    let sign_factor = positive.float().mul_scalar(inv_penalty - penalty_val).add_scalar(penalty_val);
+    let sign_factor = positive
+        .float()
+        .mul_scalar(inv_penalty - penalty_val)
+        .add_scalar(penalty_val);
     // where(positive, inv_penalty, penalty_val) = positive * (inv_penalty - penalty_val) + penalty_val
 
     // Only apply to masked positions; unmasked get factor=1.0
-    let factors = mask_2d.float().mul(sign_factor.sub_scalar(1.0)).add_scalar(1.0);
+    let factors = mask_2d
+        .float()
+        .mul(sign_factor.sub_scalar(1.0))
+        .add_scalar(1.0);
     // where(mask, sign_factor, 1.0) = mask * (sign_factor - 1.0) + 1.0
 
     logits * factors
@@ -353,6 +359,87 @@ fn multinomial_sample_vec(probs: &[f32], ctx: &mut SamplingContext) -> u32 {
     }
     // Fallback: return last valid token
     (probs.len() - 1) as u32
+}
+
+/// Convert BF16 bits to f32.
+#[inline]
+fn bf16_bits_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+/// Sample from raw BF16 logits without any Burn tensors.
+///
+/// Performs all penalty/suppression/sampling on CPU. Used by the HIP frame
+/// loop to avoid GPU↔CPU round-trips through Burn.
+pub fn sample_from_bf16_logits(
+    logits_bf16: &[u8],
+    vocab_size: usize,
+    suppression_mask: &[f32],
+    penalty_tokens: &std::collections::HashSet<u32>,
+    config: &GenerationConfig,
+    ctx: &mut SamplingContext,
+    token_count: usize,
+) -> u32 {
+    assert_eq!(logits_bf16.len(), vocab_size * 2);
+    let mut logits = Vec::with_capacity(vocab_size);
+    for i in 0..vocab_size {
+        let bits = u16::from_le_bytes([logits_bf16[i * 2], logits_bf16[i * 2 + 1]]);
+        logits.push(bf16_bits_to_f32(bits));
+    }
+
+    // Apply suppression mask (additive: 0.0 or -inf)
+    for (i, &mask_val) in suppression_mask.iter().enumerate() {
+        logits[i] += mask_val;
+    }
+
+    // Apply repetition penalty
+    if config.repetition_penalty != 1.0 && !penalty_tokens.is_empty() {
+        let penalty = config.repetition_penalty as f32;
+        for &token in penalty_tokens {
+            let idx = token as usize;
+            if idx < vocab_size {
+                if logits[idx] > 0.0 {
+                    logits[idx] /= penalty;
+                } else {
+                    logits[idx] *= penalty;
+                }
+            }
+        }
+    }
+
+    // Min new tokens EOS suppression
+    if token_count < config.min_new_tokens {
+        if let Some(eos_id) = config.eos_token_id {
+            logits[eos_id as usize] = f32::NEG_INFINITY;
+        }
+    }
+
+    // Greedy if very low temperature
+    if config.temperature < 0.01 {
+        return argmax_vec(&logits) as u32;
+    }
+
+    // Temperature scaling
+    if config.temperature != 1.0 && config.temperature > 0.0 {
+        let inv_temp = 1.0 / config.temperature as f32;
+        for v in &mut logits {
+            *v *= inv_temp;
+        }
+    }
+
+    // Top-k
+    if config.top_k > 0 {
+        top_k_filter_vec(&mut logits, config.top_k);
+    }
+
+    // Top-p
+    if config.top_p < 1.0 && config.top_p > 0.0 {
+        top_p_filter_vec(&mut logits, config.top_p as f32);
+    }
+
+    // Softmax + multinomial sample
+    softmax_vec(&mut logits);
+    multinomial_sample_vec(&logits, ctx)
 }
 
 #[cfg(test)]

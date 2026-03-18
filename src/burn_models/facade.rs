@@ -132,6 +132,10 @@ pub struct Qwen3TTS<B: Backend> {
     cp_rope: RoPEType<B>,
     model_type: Option<ModelType>,
     device: B::Device,
+    /// Zero-copy HIP frame loop (ROCm only). Drops before hip_cp/hip_talker
+    /// since it borrows kernel function handles from them.
+    #[cfg(feature = "rocm")]
+    hip_frame_loop: Option<super::hip::frame_loop::HipFrameLoop>,
     /// Raw HIP code predictor bypass (ROCm only).
     #[cfg(feature = "rocm")]
     hip_cp: Option<super::hip::code_predictor::HipCodePredictor>,
@@ -236,6 +240,22 @@ impl<B: Backend> Qwen3TTS<B> {
             }
         };
 
+        #[cfg(feature = "rocm")]
+        let hip_frame_loop = {
+            match (&hip_cp, &hip_talker) {
+                (Some(cp), Some(_)) => {
+                    match super::hip::frame_loop::HipFrameLoop::from_burn(&talker, cp, &device) {
+                        Ok(fl) => Some(fl),
+                        Err(e) => {
+                            tracing::warn!("HIP frame loop init failed, using hybrid path: {e}");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        };
+
         Self {
             talker,
             code_predictor,
@@ -247,6 +267,8 @@ impl<B: Backend> Qwen3TTS<B> {
             cp_rope,
             model_type,
             device,
+            #[cfg(feature = "rocm")]
+            hip_frame_loop,
             #[cfg(feature = "rocm")]
             hip_cp,
             #[cfg(feature = "rocm")]
@@ -727,6 +749,27 @@ impl<B: Backend> Qwen3TTS<B> {
         #[cfg(feature = "rocm")]
         self.load_hip_talker_cache(kv_caches);
 
+        // Zero-copy HIP frame loop: delegate entire generation when available
+        #[cfg(feature = "rocm")]
+        {
+            if let (Some(hip_fl), Some(hip_cp), Some(hip_talker)) =
+                (&self.hip_frame_loop, &self.hip_cp, &self.hip_talker)
+            {
+                return self.generate_codes_hip(
+                    hip_fl,
+                    hip_cp,
+                    hip_talker,
+                    gen_config,
+                    sampling_ctx,
+                    offset,
+                    last_hidden,
+                    initial_logits,
+                    trailing_text_hidden,
+                    trailing_text_len,
+                );
+            }
+        }
+
         let vocab_size = codec_tokens::CODEC_VOCAB_SIZE;
 
         // Pre-build suppression mask (reused every frame)
@@ -786,12 +829,11 @@ impl<B: Backend> Qwen3TTS<B> {
 
             #[cfg(feature = "profiling")]
             let t = std::time::Instant::now();
-            let (acoustic_codes, acoustic_embed_sum) =
-                self.run_code_predictor(
-                    last_hidden.clone(),
-                    semantic_embed.clone(),
-                    &mut cp_kv_caches,
-                );
+            let (acoustic_codes, acoustic_embed_sum) = self.run_code_predictor(
+                last_hidden.clone(),
+                semantic_embed.clone(),
+                &mut cp_kv_caches,
+            );
             #[cfg(feature = "profiling")]
             {
                 t_cp_total += t.elapsed();
@@ -976,6 +1018,55 @@ impl<B: Backend> Qwen3TTS<B> {
         }
     }
 
+    /// Run the complete generation loop on HIP with zero-copy frame loop.
+    ///
+    /// Delegates the entire frame loop to `HipFrameLoop`, which keeps all
+    /// intermediate data on GPU and performs only one sync per frame
+    /// (for logits + codes readback).
+    #[cfg(feature = "rocm")]
+    #[allow(clippy::too_many_arguments)]
+    fn generate_codes_hip(
+        &self,
+        hip_fl: &super::hip::frame_loop::HipFrameLoop,
+        hip_cp: &super::hip::code_predictor::HipCodePredictor,
+        hip_talker: &super::hip::talker::HipTalker,
+        gen_config: &GenerationConfig,
+        sampling_ctx: &mut SamplingContext,
+        offset: usize,
+        last_hidden: Tensor<B, 3>,
+        initial_logits: Tensor<B, 3>,
+        trailing_text_hidden: &Tensor<B, 3>,
+        trailing_text_len: usize,
+    ) -> FrameCodes {
+        let vocab_size = codec_tokens::CODEC_VOCAB_SIZE;
+
+        // Sample first token from prefill logits (still using Burn for this one-time op)
+        let suppression =
+            tts::build_suppression_mask::<B>(vocab_size, CODEC_EOS_TOKEN_ID, &self.device);
+        let penalty_mask = Tensor::<B, 1, Int>::zeros([vocab_size], &self.device).equal_elem(1);
+        let logits_2d = initial_logits.squeeze_dim::<2>(1);
+        let logits_2d =
+            self.apply_generation_penalties(logits_2d, &penalty_mask, gen_config, 0, &suppression);
+        let semantic_token = sampling::sample(logits_2d, gen_config, sampling_ctx);
+
+        // Extract Burn tensor data for upload to HIP
+        let hidden_data = last_hidden.into_data();
+        let text_data = trailing_text_hidden.clone().into_data();
+
+        // Delegate entire frame loop to HIP
+        hip_fl.run_loop(
+            hip_cp,
+            hip_talker,
+            hidden_data.as_bytes(),
+            text_data.as_bytes(),
+            trailing_text_len,
+            semantic_token,
+            offset,
+            gen_config,
+            sampling_ctx,
+        )
+    }
+
     /// Apply repetition penalty, token suppression, and min_new_tokens EOS mask.
     fn apply_generation_penalties(
         &self,
@@ -1042,6 +1133,12 @@ pub struct StreamingSession<'a, B: Backend> {
     token_count: usize,
     suppression_mask: SuppressionMask<B>,
     cp_kv_caches: Vec<KVCache<B>>,
+    /// CPU-side penalty tracking for HIP frame loop.
+    #[cfg(feature = "rocm")]
+    hip_penalty_set: std::collections::HashSet<u32>,
+    /// Whether the HIP frame loop is active for this session.
+    #[cfg(feature = "rocm")]
+    hip_frame_loop_active: bool,
 }
 
 impl<'a, B: Backend> StreamingSession<'a, B> {
@@ -1223,6 +1320,31 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
         let done = config.eos_token_id == Some(first_token);
         let cp_kv_caches = model.code_predictor.new_kv_caches(17, &model.device);
 
+        // Initialize HIP frame loop if available
+        #[cfg(feature = "rocm")]
+        let (hip_penalty_set, hip_frame_loop_active) = {
+            let active = if let (Some(hip_fl), Some(_hip_cp), Some(hip_talker)) =
+                (&model.hip_frame_loop, &model.hip_cp, &model.hip_talker)
+            {
+                let hidden_data = last_hidden.clone().into_data();
+                let text_data = trailing_text_hidden.clone().into_data();
+                hip_fl.init_run(
+                    hidden_data.as_bytes(),
+                    text_data.as_bytes(),
+                    trailing_text_len,
+                    hip_talker,
+                );
+                true
+            } else {
+                false
+            };
+            let mut penalty_set = std::collections::HashSet::new();
+            if active && (first_token as usize) < vocab_size {
+                penalty_set.insert(first_token);
+            }
+            (penalty_set, active)
+        };
+
         Ok(Self {
             model,
             config,
@@ -1242,6 +1364,10 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
             token_count: 1,
             suppression_mask,
             cp_kv_caches,
+            #[cfg(feature = "rocm")]
+            hip_penalty_set,
+            #[cfg(feature = "rocm")]
+            hip_frame_loop_active,
         })
     }
 
@@ -1290,6 +1416,31 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
         let done = config.eos_token_id == Some(first_token);
         let cp_kv_caches = model.code_predictor.new_kv_caches(17, &model.device);
 
+        // Initialize HIP frame loop if available
+        #[cfg(feature = "rocm")]
+        let (hip_penalty_set, hip_frame_loop_active) = {
+            let active = if let (Some(hip_fl), Some(_hip_cp), Some(hip_talker)) =
+                (&model.hip_frame_loop, &model.hip_cp, &model.hip_talker)
+            {
+                let hidden_data = last_hidden.clone().into_data();
+                let text_data = trailing_text_hidden.clone().into_data();
+                hip_fl.init_run(
+                    hidden_data.as_bytes(),
+                    text_data.as_bytes(),
+                    trailing_text_len,
+                    hip_talker,
+                );
+                true
+            } else {
+                false
+            };
+            let mut penalty_set = std::collections::HashSet::new();
+            if active && (first_token as usize) < vocab_size {
+                penalty_set.insert(first_token);
+            }
+            (penalty_set, active)
+        };
+
         Self {
             model,
             config,
@@ -1309,6 +1460,10 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
             token_count: 1,
             suppression_mask,
             cp_kv_caches,
+            #[cfg(feature = "rocm")]
+            hip_penalty_set,
+            #[cfg(feature = "rocm")]
+            hip_frame_loop_active,
         }
     }
 
@@ -1338,6 +1493,52 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
                 }
             };
 
+            // HIP frame loop path: zero-copy per-frame generation
+            #[cfg(feature = "rocm")]
+            {
+                if self.hip_frame_loop_active {
+                    if let (Some(hip_fl), Some(hip_cp), Some(hip_talker)) = (
+                        &self.model.hip_frame_loop,
+                        &self.model.hip_cp,
+                        &self.model.hip_talker,
+                    ) {
+                        let frame_idx = self.frames_generated;
+                        self.frames_generated += 1;
+
+                        let (frame, next_token) = hip_fl.run_frame(
+                            hip_cp,
+                            hip_talker,
+                            token_id,
+                            frame_idx,
+                            self.offset,
+                            self.trailing_text_len,
+                            &self.hip_penalty_set,
+                            &self.config,
+                            &mut self.sampling_ctx,
+                            self.token_count,
+                        );
+                        self.frame_buffer.push(frame);
+                        self.offset += 1;
+                        self.token_count += 1;
+
+                        let vocab_size = codec_tokens::CODEC_VOCAB_SIZE;
+                        if (next_token as usize) < vocab_size {
+                            self.hip_penalty_set.insert(next_token);
+                        }
+
+                        if self.config.eos_token_id == Some(next_token) {
+                            self.current_token = None;
+                            self.done = true;
+                        } else {
+                            self.current_token = Some(next_token);
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // Burn/hybrid path (fallback when HIP frame loop not available)
+
             // Embed semantic token
             let semantic_embed = self
                 .model
@@ -1345,12 +1546,11 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
                 .get_codec_embedding(token_id, &self.model.device);
 
             // Generate 15 acoustic codes
-            let (acoustic_codes, acoustic_embed_sum) =
-                self.model.run_code_predictor(
-                    self.last_hidden.clone(),
-                    semantic_embed.clone(),
-                    &mut self.cp_kv_caches,
-                );
+            let (acoustic_codes, acoustic_embed_sum) = self.model.run_code_predictor(
+                self.last_hidden.clone(),
+                semantic_embed.clone(),
+                &mut self.cp_kv_caches,
+            );
 
             // Build frame
             let mut frame = Vec::with_capacity(16);
