@@ -151,9 +151,11 @@ impl HipFrameLoop {
             max = self.max_text_len,
         );
 
-        // Upload initial hidden to talker's input_buf (persists between frames)
+        // Upload initial hidden (post-norm from Burn prefill) to talker's normed_buf.
+        // The code predictor reads from normed_ptr() (matching Burn's post-norm convention).
+        // After each talker step, forward_one_token writes normed_buf via final RMSNorm.
         hip_h2d(
-            hip_talker.input_ptr(),
+            hip_talker.normed_ptr(),
             initial_hidden_bytes.as_ptr() as *const c_void,
             initial_hidden_bytes.len(),
         );
@@ -203,9 +205,10 @@ impl HipFrameLoop {
             self.hidden_size,
         );
 
-        // 2. Code predictor: reads from talker.input_buf (hidden) + semantic_embed_buf
-        //    All kernel launches go on self.stream via the Cell swap
-        hip_cp.generate_gpu_to_gpu(self.stream, hip_talker.input_ptr(), self.semantic_embed_buf);
+        // 2. Code predictor: reads from talker.normed_buf (post-norm hidden) + semantic_embed_buf
+        //    Uses normed_ptr (after final RMSNorm) to match Burn's generate_step_with_embed
+        //    which returns hidden AFTER norm.forward().
+        hip_cp.generate_gpu_to_gpu(self.stream, hip_talker.normed_ptr(), self.semantic_embed_buf);
 
         // 3. Embed+fuse: semantic_embed_buf += acoustic_embed_sum + text
         self.launch_add_inplace(

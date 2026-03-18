@@ -318,11 +318,12 @@ impl HipTalker {
         // Sync and read results
         unsafe { cubecl_hip_sys::hipStreamSynchronize(self.active_stream.get()) };
 
-        // Read last_hidden from input_buf (after all residual additions)
+        // Read last_hidden from normed_buf (after final RMSNorm, matching Burn's
+        // generate_step_with_embed which returns hidden AFTER norm.forward())
         let mut hidden_bytes = vec![0u8; self.hidden_size * 2];
         hip_d2h(
             hidden_bytes.as_mut_ptr() as *mut c_void,
-            self.input_buf,
+            self.normed_buf,
             self.hidden_size * 2,
         );
 
@@ -716,8 +717,17 @@ impl HipTalker {
 
     // ==================== Accessors for frame loop ====================
 
+    #[allow(dead_code)]
     pub(crate) fn input_ptr(&self) -> *mut c_void {
         self.input_buf
+    }
+    /// Pointer to the normed hidden state (after final RMSNorm).
+    ///
+    /// This is the correct hidden state to pass to the code predictor,
+    /// matching Burn's `generate_step_with_embed` which returns hidden
+    /// AFTER `norm.forward()`.
+    pub(crate) fn normed_ptr(&self) -> *mut c_void {
+        self.normed_buf
     }
     pub(crate) fn logits_ptr(&self) -> *mut c_void {
         self.logits_buf

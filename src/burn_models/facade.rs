@@ -210,7 +210,28 @@ impl<B: Backend> Qwen3TTS<B> {
         let cp_rope = code_predictor.create_rope(&device);
 
         #[cfg(feature = "rocm")]
-        let hip_cp = {
+        let disable_all = std::env::var("DISABLE_HIP").is_ok();
+        #[cfg(feature = "rocm")]
+        let disable_cp = disable_all || std::env::var("DISABLE_HIP_CP").is_ok();
+        #[cfg(feature = "rocm")]
+        let disable_talker = disable_all || std::env::var("DISABLE_HIP_TALKER").is_ok();
+
+        #[cfg(feature = "rocm")]
+        if disable_all {
+            tracing::warn!("DISABLE_HIP set — using pure Burn path");
+        } else {
+            if disable_cp {
+                tracing::warn!("DISABLE_HIP_CP set — using Burn code predictor");
+            }
+            if disable_talker {
+                tracing::warn!("DISABLE_HIP_TALKER set — using Burn talker decode");
+            }
+        }
+
+        #[cfg(feature = "rocm")]
+        let hip_cp = if disable_cp {
+            None
+        } else {
             let (cos_data, sin_data) = cp_rope.cos_sin_data();
             let config = code_predictor.config();
             match super::hip::code_predictor::HipCodePredictor::from_burn(
@@ -228,7 +249,9 @@ impl<B: Backend> Qwen3TTS<B> {
         };
 
         #[cfg(feature = "rocm")]
-        let hip_talker = {
+        let hip_talker = if disable_talker {
+            None
+        } else {
             // max_seq = generous upper bound for prefill + decode
             let max_seq = 256 + 2048 + 100; // prefill tokens + max decode frames + margin
             match super::hip::talker::HipTalker::from_burn(&talker, &rope, max_seq) {
