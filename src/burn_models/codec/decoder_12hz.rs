@@ -872,4 +872,21 @@ mod tests {
         let output = snake.forward(input);
         assert_eq!(output.dims(), [2, 64, 100]);
     }
+
+    #[test]
+    fn test_causal_transconv_shape() {
+        let device = Default::default();
+        // UpsampleStage-style: stride=2, kernel=4
+        let tc = CausalTransConv1d::<B>::new(4, 4, 4, 2, &device);
+        for in_len in [1, 2, 3, 4, 5] {
+            let input = Tensor::<B, 3>::zeros([1, 4, in_len], &device);
+            let output = tc.forward(input);
+            let out_len = output.dims()[2];
+            assert_eq!(
+                out_len,
+                in_len * 2,
+                "expected in*stride for in_len={in_len}"
+            );
+        }
+    }
 }

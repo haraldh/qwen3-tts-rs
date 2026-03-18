@@ -698,16 +698,41 @@ impl<B: Backend> Qwen3TTS<B> {
         #[cfg(feature = "profiling")]
         let _decode_span = tracing::info_span!("decode").entered();
 
-        let tensor = self.codes_to_tensor(codes);
+        // Workaround: ROCm ConvTranspose1d produces shorter output than expected
+        // for very short sequences (in_len=1 with stride=2 gives out_len=2 instead
+        // of 4), causing CausalTransConv1d trimming to underflow.  Pad to 2 frames
+        // minimum and trim the extra audio afterward.
+        let (tensor, original_frames) = if codes.len() < 2 {
+            let mut padded = codes.to_vec();
+            while padded.len() < 2 {
+                padded.push(padded.last().unwrap().clone());
+            }
+            let t = self.codes_to_tensor(&padded);
+            (t, codes.len())
+        } else {
+            let t = self.codes_to_tensor(codes);
+            let n = codes.len();
+            (t, n)
+        };
+
+        let total_frames = if codes.len() < 2 { 2 } else { codes.len() };
         let waveform = self.decoder.decode(tensor); // [1, 1, samples]
-        let num_samples = waveform.dims()[2];
+        let total_samples = waveform.dims()[2];
+
+        // If we padded, keep only the proportion from original frames
+        let num_samples = if original_frames < total_frames {
+            total_samples * original_frames / total_frames
+        } else {
+            total_samples
+        };
+
         let samples: Vec<f32> = waveform
-            .reshape([num_samples])
+            .reshape([total_samples])
             .into_data()
             .convert::<f32>()
             .to_vec()
             .unwrap();
-        Ok(AudioBuffer::new(samples, 24000))
+        Ok(AudioBuffer::new(samples[..num_samples].to_vec(), 24000))
     }
 
     // ── Private helpers ──────────────────────────────────────────────────
