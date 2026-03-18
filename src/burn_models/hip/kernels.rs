@@ -13,6 +13,7 @@ pub(crate) struct HipKernels {
     pub qk_norm_rope: hipFunction_t,
     pub kv_cache_append: hipFunction_t,
     pub attention_decode: hipFunction_t,
+    pub attention_decode_long: hipFunction_t,
     pub silu_mul: hipFunction_t,
     pub add_inplace: hipFunction_t,
     pub argmax: hipFunction_t,
@@ -269,6 +270,89 @@ extern "C" __global__ void attention_decode_bf16(
     }
 }
 
+// ============ Attention Decode Long (seq_q=1, flat parallel) ============
+// Optimized for long sequences (up to 4096+). Each thread independently computes
+// full dot products for its assigned KV positions — no __syncthreads in the score loop.
+// This eliminates ~7*seq_kv barrier syncs compared to the cooperative reduction approach.
+// One block per query head. Dynamic shared memory for scores.
+#define ATTN_LONG_BLOCK 128
+
+extern "C" __global__ void attention_decode_long_bf16(
+    const bf16* __restrict__ Q,
+    const bf16* __restrict__ K_cache,
+    const bf16* __restrict__ V_cache,
+    bf16* __restrict__ output,
+    int num_q_heads, int num_kv_heads, int head_dim,
+    int max_seq, int seq_kv, float scale)
+{
+    int h = blockIdx.x;
+    int kv_h = h * num_kv_heads / num_q_heads;
+    int tid = threadIdx.x;
+
+    const bf16* q = Q + h * head_dim;
+    const bf16* k_base = K_cache + kv_h * max_seq * head_dim;
+    const bf16* v_base = V_cache + kv_h * max_seq * head_dim;
+    bf16* out = output + h * head_dim;
+
+    // Dynamic shared memory: [0..seq_kv) = scores, [seq_kv..seq_kv+BLOCK) = reduce
+    extern __shared__ float smem[];
+    float* s_scores = smem;
+    float* s_reduce = smem + seq_kv;
+
+    // Step 1: Each thread computes full dot products for its assigned positions.
+    // No sync needed — each thread works independently.
+    for (int s = tid; s < seq_kv; s += blockDim.x) {
+        const bf16* k = k_base + s * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += bf16_to_f32(q[d]) * bf16_to_f32(k[d]);
+        }
+        s_scores[s] = dot * scale;
+    }
+    __syncthreads();
+
+    // Step 2: Softmax (thread-parallel)
+    float local_max = -1e30f;
+    for (int s = tid; s < seq_kv; s += blockDim.x) {
+        local_max = fmaxf(local_max, s_scores[s]);
+    }
+    s_reduce[tid] = local_max;
+    __syncthreads();
+    for (int r = blockDim.x / 2; r > 0; r >>= 1) {
+        if (tid < r) s_reduce[tid] = fmaxf(s_reduce[tid], s_reduce[tid + r]);
+        __syncthreads();
+    }
+    float max_val = s_reduce[0];
+
+    float local_sum = 0.0f;
+    for (int s = tid; s < seq_kv; s += blockDim.x) {
+        float e = expf(s_scores[s] - max_val);
+        s_scores[s] = e;
+        local_sum += e;
+    }
+    s_reduce[tid] = local_sum;
+    __syncthreads();
+    for (int r = blockDim.x / 2; r > 0; r >>= 1) {
+        if (tid < r) s_reduce[tid] += s_reduce[tid + r];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / s_reduce[0];
+
+    for (int s = tid; s < seq_kv; s += blockDim.x) {
+        s_scores[s] *= inv_sum;
+    }
+    __syncthreads();
+
+    // Step 3: Weighted sum of V
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float val = 0.0f;
+        for (int s = 0; s < seq_kv; s++) {
+            val += s_scores[s] * bf16_to_f32(v_base[s * head_dim + d]);
+        }
+        out[d] = f32_to_bf16(val);
+    }
+}
+
 // ============ SiLU * Mul (fused) ============
 extern "C" __global__ void silu_mul_bf16(
     const bf16* __restrict__ gate,
@@ -433,6 +517,7 @@ impl HipKernels {
             qk_norm_rope: get_fn("qk_norm_rope_bf16")?,
             kv_cache_append: get_fn("kv_cache_append_bf16")?,
             attention_decode: get_fn("attention_decode_bf16")?,
+            attention_decode_long: get_fn("attention_decode_long_bf16")?,
             silu_mul: get_fn("silu_mul_bf16")?,
             add_inplace: get_fn("add_inplace_bf16")?,
             argmax: get_fn("argmax_bf16")?,

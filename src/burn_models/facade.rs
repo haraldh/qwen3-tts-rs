@@ -135,6 +135,9 @@ pub struct Qwen3TTS<B: Backend> {
     /// Raw HIP code predictor bypass (ROCm only).
     #[cfg(feature = "rocm")]
     hip_cp: Option<super::hip::code_predictor::HipCodePredictor>,
+    /// Raw HIP talker bypass for decode steps (ROCm only).
+    #[cfg(feature = "rocm")]
+    hip_talker: Option<super::hip::talker::HipTalker>,
 }
 
 impl<B: Backend> Qwen3TTS<B> {
@@ -220,6 +223,19 @@ impl<B: Backend> Qwen3TTS<B> {
             }
         };
 
+        #[cfg(feature = "rocm")]
+        let hip_talker = {
+            // max_seq = generous upper bound for prefill + decode
+            let max_seq = 256 + 2048 + 100; // prefill tokens + max decode frames + margin
+            match super::hip::talker::HipTalker::from_burn(&talker, &rope, max_seq) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    tracing::warn!("HIP talker init failed, using Burn fallback: {e}");
+                    None
+                }
+            }
+        };
+
         Self {
             talker,
             code_predictor,
@@ -233,6 +249,8 @@ impl<B: Backend> Qwen3TTS<B> {
             device,
             #[cfg(feature = "rocm")]
             hip_cp,
+            #[cfg(feature = "rocm")]
+            hip_talker,
         }
     }
 
@@ -705,6 +723,10 @@ impl<B: Backend> Qwen3TTS<B> {
         trailing_text_len: usize,
         tts_pad_embed: &Tensor<B, 3>,
     ) -> FrameCodes {
+        // Transfer prefill KV data to HIP talker (no-op if no HIP talker)
+        #[cfg(feature = "rocm")]
+        self.load_hip_talker_cache(kv_caches);
+
         let vocab_size = codec_tokens::CODEC_VOCAB_SIZE;
 
         // Pre-build suppression mask (reused every frame)
@@ -807,9 +829,7 @@ impl<B: Backend> Qwen3TTS<B> {
 
             #[cfg(feature = "profiling")]
             let t = std::time::Instant::now();
-            let (h, new_logits) = self
-                .talker
-                .generate_step_with_embed(step_input, &self.rope, kv_caches, offset);
+            let (h, new_logits) = self.run_talker_step(step_input, kv_caches, offset);
             offset += 1;
             last_hidden = h;
             #[cfg(feature = "profiling")]
@@ -908,6 +928,52 @@ impl<B: Backend> Qwen3TTS<B> {
             cp_kv_caches,
             &self.device,
         )
+    }
+
+    /// Run talker decode step, using HIP bypass on ROCm when available.
+    fn run_talker_step(
+        &self,
+        step_input: Tensor<B, 3>,
+        kv_caches: &mut [KVCache<B>],
+        offset: usize,
+    ) -> (Tensor<B, 3>, Tensor<B, 3>) {
+        #[cfg(feature = "rocm")]
+        {
+            if let Some(hip_talker) = &self.hip_talker {
+                let input_data = step_input.into_data();
+                let dtype = input_data.dtype;
+                let (hidden_bytes, logits_bytes) =
+                    hip_talker.forward_decode(input_data.as_bytes(), offset);
+
+                let hidden = Tensor::from_data(
+                    TensorData::from_bytes_vec(
+                        hidden_bytes,
+                        [1, 1, self.talker.config().hidden_size],
+                        dtype,
+                    ),
+                    &self.device,
+                );
+                let logits = Tensor::from_data(
+                    TensorData::from_bytes_vec(
+                        logits_bytes,
+                        [1, 1, self.talker.config().codec_vocab_size],
+                        dtype,
+                    ),
+                    &self.device,
+                );
+                return (hidden, logits);
+            }
+        }
+        self.talker
+            .generate_step_with_embed(step_input, &self.rope, kv_caches, offset)
+    }
+
+    /// Load Burn KV caches into HIP talker after prefill.
+    #[cfg(feature = "rocm")]
+    fn load_hip_talker_cache(&self, kv_caches: &[KVCache<B>]) {
+        if let Some(hip_talker) = &self.hip_talker {
+            hip_talker.load_prefill_cache(kv_caches);
+        }
     }
 
     /// Apply repetition penalty, token suppression, and min_new_tokens EOS mask.
@@ -1127,6 +1193,10 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
                 (trailing, trailing_len, tts_pad, logits)
             };
 
+        // Transfer prefill KV data to HIP talker
+        #[cfg(feature = "rocm")]
+        model.load_hip_talker_cache(&kv_caches);
+
         // Now build the session using the resolved state.
         // We can't use from_prefill because we've already extracted last_hidden
         // and may have modified offset via ICL.
@@ -1188,6 +1258,10 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
         tts_pad_embed: Tensor<B, 3>,
         chunk_frames: usize,
     ) -> Self {
+        // Transfer prefill KV data to HIP talker
+        #[cfg(feature = "rocm")]
+        model.load_hip_talker_cache(&kv_caches);
+
         let (hidden, logits) = prefill_result;
         let prefill_len = hidden.dims()[1];
         let last_hidden = hidden.narrow(1, prefill_len - 1, 1);
@@ -1298,12 +1372,9 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
             let step_input = summed + text_addition;
 
             // Talker step
-            let (h, new_logits) = self.model.talker.generate_step_with_embed(
-                step_input,
-                &self.model.rope,
-                &mut self.kv_caches,
-                self.offset,
-            );
+            let (h, new_logits) =
+                self.model
+                    .run_talker_step(step_input, &mut self.kv_caches, self.offset);
             self.offset += 1;
             self.last_hidden = h;
 

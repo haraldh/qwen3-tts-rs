@@ -5,4 +5,5 @@
 //! from ~7071 dispatches/frame to ~1200 by using custom fused kernels.
 
 pub mod code_predictor;
+pub mod talker;
 mod kernels;

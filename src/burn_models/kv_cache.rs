@@ -108,6 +108,18 @@ impl<B: Backend> KVCache<B> {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// Get references to the underlying K and V tensors and the valid length.
+    ///
+    /// Used by the HIP talker to extract prefill KV data for upload.
+    #[cfg(feature = "rocm")]
+    pub fn raw_kv(&self) -> (&Tensor<B, 4>, &Tensor<B, 4>, usize) {
+        (
+            self.k.as_ref().unwrap(),
+            self.v.as_ref().unwrap(),
+            self.len,
+        )
+    }
 }
 
 #[cfg(test)]

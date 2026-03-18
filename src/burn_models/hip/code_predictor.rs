@@ -653,15 +653,15 @@ impl Drop for HipCodePredictor {
 // ==================== Helpers ====================
 
 #[inline]
-fn ptr_of<T>(val: &mut T) -> *mut c_void {
+pub(crate) fn ptr_of<T>(val: &mut T) -> *mut c_void {
     val as *mut T as *mut c_void
 }
 
-fn div_ceil(a: usize, b: usize) -> usize {
+pub(crate) fn div_ceil(a: usize, b: usize) -> usize {
     (a + b - 1) / b
 }
 
-fn hip_check(status: u32, op: &str) -> Result<(), String> {
+pub(crate) fn hip_check(status: u32, op: &str) -> Result<(), String> {
     if status != HIP_SUCCESS {
         Err(format!("{op} failed: {status}"))
     } else {
@@ -669,35 +669,35 @@ fn hip_check(status: u32, op: &str) -> Result<(), String> {
     }
 }
 
-fn hip_malloc(size: usize) -> *mut c_void {
+pub(crate) fn hip_malloc(size: usize) -> *mut c_void {
     let mut ptr: *mut c_void = std::ptr::null_mut();
     let s = unsafe { cubecl_hip_sys::hipMalloc(&mut ptr, size) };
     assert_eq!(s, HIP_SUCCESS, "hipMalloc({size}) failed: {s}");
     ptr
 }
 
-fn hip_h2d(dst: *mut c_void, src: *const c_void, size: usize) {
+pub(crate) fn hip_h2d(dst: *mut c_void, src: *const c_void, size: usize) {
     let s = unsafe { cubecl_hip_sys::hipMemcpy(dst, src, size, hipMemcpyKind_hipMemcpyHostToDevice) };
     assert_eq!(s, HIP_SUCCESS, "hipMemcpy H2D failed: {s}");
 }
 
-fn hip_d2h(dst: *mut c_void, src: *mut c_void, size: usize) {
+pub(crate) fn hip_d2h(dst: *mut c_void, src: *mut c_void, size: usize) {
     let s = unsafe { cubecl_hip_sys::hipMemcpy(dst, src as *const _, size, hipMemcpyKind_hipMemcpyDeviceToHost) };
     assert_eq!(s, HIP_SUCCESS, "hipMemcpy D2H failed: {s}");
 }
 
 /// GPU memory allocator that tracks all allocations for cleanup.
-struct GpuAlloc {
-    ptrs: Vec<*mut c_void>,
-    total_bytes: usize,
+pub(crate) struct GpuAlloc {
+    pub(crate) ptrs: Vec<*mut c_void>,
+    pub(crate) total_bytes: usize,
 }
 
 impl GpuAlloc {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { ptrs: Vec::new(), total_bytes: 0 }
     }
 
-    fn upload(&mut self, data: &TensorData) -> *mut c_void {
+    pub(crate) fn upload(&mut self, data: &TensorData) -> *mut c_void {
         let bytes = data.as_bytes();
         self.total_bytes += bytes.len();
         let ptr = hip_malloc(bytes.len());
@@ -709,7 +709,7 @@ impl GpuAlloc {
     /// Upload a 2D weight matrix, transposing from [rows, cols] to [cols, rows].
     /// Burn stores Linear weights as [d_input, d_output] but our gemv kernel
     /// expects [d_output, d_input] for coalesced reads.
-    fn upload_transposed(&mut self, data: &TensorData, rows: usize, cols: usize) -> *mut c_void {
+    pub(crate) fn upload_transposed(&mut self, data: &TensorData, rows: usize, cols: usize) -> *mut c_void {
         let bytes = data.as_bytes();
         assert_eq!(bytes.len(), rows * cols * 2, "Weight size mismatch");
         self.total_bytes += bytes.len();
@@ -731,7 +731,7 @@ impl GpuAlloc {
         ptr
     }
 
-    fn alloc(&mut self, size: usize) -> *mut c_void {
+    pub(crate) fn alloc(&mut self, size: usize) -> *mut c_void {
         let ptr = hip_malloc(size);
         self.ptrs.push(ptr);
         ptr
