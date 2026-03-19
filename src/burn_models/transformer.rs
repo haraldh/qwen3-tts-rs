@@ -321,6 +321,16 @@ impl<B: Backend> Attention<B> {
             let weights = burn::tensor::activation::softmax(scores, 3);
             // weights: [B, H, 1, S] @ v: [B, H, S, D] → [B, H, 1, D]
             weights.matmul(v)
+        } else if offset > 0 && is_causal {
+            // ICL continuation: cubek flash attention uses top-left aligned
+            // causal masking which prevents new tokens from attending to the
+            // cached prefix. Use manual matmul attention with explicit mask.
+            let scale = (self.head_dim as f64).powf(-0.5);
+            let scores = q.matmul(k.swap_dims(2, 3)).mul_scalar(scale);
+            let mask = create_causal_mask::<B>(seq_len, offset, &scores.device());
+            let scores = scores.mask_fill(mask, f32::NEG_INFINITY);
+            let weights = burn::tensor::activation::softmax(scores, 3);
+            weights.matmul(v)
         } else {
             let options = burn::tensor::ops::AttentionModuleOptions {
                 scale: None,

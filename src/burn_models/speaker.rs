@@ -45,8 +45,8 @@ fn reflect_pad_1d<B: Backend>(x: Tensor<B, 3>, pad_left: usize, pad_right: usize
 
 /// Conv1d with "same" output length via reflect padding.
 #[derive(Module, Debug)]
-struct ReflectPadConv1d<B: Backend> {
-    conv: Conv1d<B>,
+pub(crate) struct ReflectPadConv1d<B: Backend> {
+    pub(crate) conv: Conv1d<B>,
     #[module(skip)]
     pad_left: usize,
     #[module(skip)]
@@ -88,8 +88,8 @@ impl<B: Backend> ReflectPadConv1d<B> {
 
 /// Time-delay neural network block: Conv1d (reflect-padded) + ReLU.
 #[derive(Module, Debug)]
-struct TimeDelayNetBlock<B: Backend> {
-    conv: ReflectPadConv1d<B>,
+pub(crate) struct TimeDelayNetBlock<B: Backend> {
+    pub(crate) conv: ReflectPadConv1d<B>,
 }
 
 impl<B: Backend> TimeDelayNetBlock<B> {
@@ -112,8 +112,8 @@ impl<B: Backend> TimeDelayNetBlock<B> {
 
 /// Res2Net block with cascaded TDNNs.
 #[derive(Module, Debug)]
-struct Res2NetBlock<B: Backend> {
-    blocks: Vec<TimeDelayNetBlock<B>>,
+pub(crate) struct Res2NetBlock<B: Backend> {
+    pub(crate) blocks: Vec<TimeDelayNetBlock<B>>,
     #[module(skip)]
     scale: usize,
     #[module(skip)]
@@ -163,9 +163,9 @@ impl<B: Backend> Res2NetBlock<B> {
 
 /// Squeeze-and-excitation block for channel attention.
 #[derive(Module, Debug)]
-struct SqueezeExcitationBlock<B: Backend> {
-    conv1: Conv1d<B>,
-    conv2: Conv1d<B>,
+pub(crate) struct SqueezeExcitationBlock<B: Backend> {
+    pub(crate) conv1: Conv1d<B>,
+    pub(crate) conv2: Conv1d<B>,
 }
 
 impl<B: Backend> SqueezeExcitationBlock<B> {
@@ -192,11 +192,11 @@ impl<B: Backend> SqueezeExcitationBlock<B> {
 
 /// SE-Res2Net block: TDNN1 → Res2Net → TDNN2 → SE → residual add.
 #[derive(Module, Debug)]
-struct SqueezeExcitationRes2NetBlock<B: Backend> {
-    tdnn1: TimeDelayNetBlock<B>,
-    res2net_block: Res2NetBlock<B>,
-    tdnn2: TimeDelayNetBlock<B>,
-    se_block: SqueezeExcitationBlock<B>,
+pub(crate) struct SqueezeExcitationRes2NetBlock<B: Backend> {
+    pub(crate) tdnn1: TimeDelayNetBlock<B>,
+    pub(crate) res2net_block: Res2NetBlock<B>,
+    pub(crate) tdnn2: TimeDelayNetBlock<B>,
+    pub(crate) se_block: SqueezeExcitationBlock<B>,
 }
 
 impl<B: Backend> SqueezeExcitationRes2NetBlock<B> {
@@ -228,9 +228,9 @@ impl<B: Backend> SqueezeExcitationRes2NetBlock<B> {
 
 /// Attentive statistics pooling.
 #[derive(Module, Debug)]
-struct AttentiveStatisticsPooling<B: Backend> {
-    tdnn: TimeDelayNetBlock<B>,
-    conv: Conv1d<B>,
+pub(crate) struct AttentiveStatisticsPooling<B: Backend> {
+    pub(crate) tdnn: TimeDelayNetBlock<B>,
+    pub(crate) conv: Conv1d<B>,
 }
 
 impl<B: Backend> AttentiveStatisticsPooling<B> {
@@ -283,11 +283,11 @@ impl<B: Backend> AttentiveStatisticsPooling<B> {
 /// Full ECAPA-TDNN speaker encoder.
 #[derive(Module, Debug)]
 pub struct SpeakerEncoder<B: Backend> {
-    initial_tdnn: TimeDelayNetBlock<B>,
-    se_res2net_blocks: Vec<SqueezeExcitationRes2NetBlock<B>>,
-    mfa_tdnn: TimeDelayNetBlock<B>,
-    asp: AttentiveStatisticsPooling<B>,
-    fc: Conv1d<B>,
+    pub(crate) initial_tdnn: TimeDelayNetBlock<B>,
+    pub(crate) se_res2net_blocks: Vec<SqueezeExcitationRes2NetBlock<B>>,
+    pub(crate) mfa_tdnn: TimeDelayNetBlock<B>,
+    pub(crate) asp: AttentiveStatisticsPooling<B>,
+    pub(crate) fc: Conv1d<B>,
 }
 
 impl<B: Backend> SpeakerEncoder<B> {

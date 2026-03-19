@@ -475,9 +475,13 @@ impl<B: Backend> TalkerModel<B> {
         let tts_pad_embed = self.get_tts_pad_embed(device); // [1, 1, hidden]
 
         // 3. Streaming layout: element-wise overlay
+        // Upcast to F32 for the addition to avoid BF16 rounding errors that
+        // corrupt the ICL embeddings on low-precision backends.
+        let f32 = burn::tensor::FloatDType::F32;
+        let native: burn::tensor::FloatDType = codec_embed.dtype().into();
         if n_text > n_codec {
             let text_head = text_embed.clone().narrow(1, 0, n_codec);
-            let icl_embed = text_head + codec_embed;
+            let icl_embed = (text_head.cast(f32) + codec_embed.cast(f32)).cast(native);
             let trailing = text_embed.narrow(1, n_codec, n_text - n_codec);
             (icl_embed, trailing)
         } else {
@@ -490,7 +494,7 @@ impl<B: Backend> TalkerModel<B> {
             } else {
                 text_embed
             };
-            let icl_embed = padded_text + codec_embed;
+            let icl_embed = (padded_text.cast(f32) + codec_embed.cast(f32)).cast(native);
             (icl_embed, tts_pad_embed)
         }
     }

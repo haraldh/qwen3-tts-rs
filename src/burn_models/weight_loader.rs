@@ -21,7 +21,7 @@ use super::talker::{TalkerConfig, TalkerModel, TextProjection};
 use super::transformer::{
     Attention, AttentionConfig, DecoderLayer, DecoderLayerConfig, MLPConfig, MLP,
 };
-use crate::models::config::ParsedModelConfig;
+use crate::models::config::{ParsedModelConfig, SpeakerEncoderConfig};
 
 // ── Tensor data extraction ───────────────────────────────────────────────
 
@@ -1183,6 +1183,59 @@ fn load_normalized_codebook_for_vq<B: Backend>(
     Ok(())
 }
 
+/// Load an ECAPA-TDNN speaker encoder from a safetensors file.
+///
+/// The speaker encoder weights live under the `speaker_encoder.` prefix
+/// in the main `model.safetensors` file (Base models only).
+fn load_speaker_encoder<B: Backend>(
+    safetensors_path: &Path,
+    config: SpeakerEncoderConfig,
+    device: &B::Device,
+) -> Result<SpeakerEncoder<B>> {
+    let all_tensors = load_safetensors_f32(safetensors_path)?;
+    let se = filter_by_prefix(&all_tensors, "speaker_encoder.");
+
+    let mut encoder = SpeakerEncoder::<B>::init(config, device);
+
+    // Initial TDNN (blocks.0)
+    load_conv1d_weights(&mut encoder.initial_tdnn.conv.conv, &se, "blocks.0.conv.", device)?;
+
+    // SE-Res2Net blocks (blocks.1, blocks.2, blocks.3 in safetensors → index 0,1,2)
+    for i in 0..3 {
+        let block = &mut encoder.se_res2net_blocks[i];
+        let p = format!("blocks.{}.", i + 1);
+
+        load_conv1d_weights(&mut block.tdnn1.conv.conv, &se, &format!("{p}tdnn1.conv."), device)?;
+
+        for k in 0..block.res2net_block.blocks.len() {
+            load_conv1d_weights(
+                &mut block.res2net_block.blocks[k].conv.conv,
+                &se,
+                &format!("{p}res2net_block.blocks.{k}.conv."),
+                device,
+            )?;
+        }
+
+        load_conv1d_weights(&mut block.tdnn2.conv.conv, &se, &format!("{p}tdnn2.conv."), device)?;
+
+        // SE block conv1/conv2 are direct Conv1d (not wrapped in ReflectPadConv1d)
+        load_conv1d_weights(&mut block.se_block.conv1, &se, &format!("{p}se_block.conv1."), device)?;
+        load_conv1d_weights(&mut block.se_block.conv2, &se, &format!("{p}se_block.conv2."), device)?;
+    }
+
+    // MFA TDNN
+    load_conv1d_weights(&mut encoder.mfa_tdnn.conv.conv, &se, "mfa.conv.", device)?;
+
+    // ASP (attentive statistics pooling)
+    load_conv1d_weights(&mut encoder.asp.tdnn.conv.conv, &se, "asp.tdnn.conv.", device)?;
+    load_conv1d_weights(&mut encoder.asp.conv, &se, "asp.conv.", device)?;
+
+    // Final FC projection
+    load_conv1d_weights(&mut encoder.fc, &se, "fc.", device)?;
+
+    Ok(encoder)
+}
+
 /// Load all model components from a model directory.
 ///
 /// Expected directory structure:
@@ -1228,17 +1281,27 @@ pub fn load_all<B: Backend>(model_dir: &Path, device: &B::Device) -> Result<Load
     tracing::info!("Loading decoder (12Hz)...");
     let decoder = load_decoder(&st_path, Decoder12HzConfig::default(), device)?;
 
-    // Load encoder (for ICL voice cloning — all model types have it)
-    tracing::info!("Loading encoder (12Hz)...");
-    let encoder = load_encoder(&st_path, Encoder12HzConfig::default(), device)?;
+    // Load encoder on CPU (for ICL voice cloning — all model types have it).
+    // Runs once per voice clone call. On GPU, BF16 autotuning crashes on HIP/RDNA
+    // due to deferred page faults from benchmark candidates across matmul, conv,
+    // and reduce operations.
+    tracing::info!("Loading encoder (12Hz) on CPU...");
+    let cpu_device = burn::backend::ndarray::NdArrayDevice::Cpu;
+    let encoder = load_encoder::<burn::backend::NdArray>(
+        &st_path,
+        Encoder12HzConfig::default(),
+        &cpu_device,
+    )?;
 
-    // Load speaker encoder (Base models only)
-    let speaker_encoder = if parsed.speaker_encoder_config.is_some() {
-        tracing::warn!(
-            "Speaker encoder weight loading not yet implemented — \
-             voice cloning will not work."
-        );
-        None
+    // Load speaker encoder on CPU (Base models only).
+    // The speaker encoder is small (~10M params) and runs once per synthesis.
+    let speaker_encoder = if let Some(ref se_config) = parsed.speaker_encoder_config {
+        tracing::info!("Loading speaker encoder (ECAPA-TDNN) on CPU...");
+        Some(load_speaker_encoder::<burn::backend::NdArray>(
+            &model_path,
+            se_config.clone(),
+            &cpu_device,
+        )?)
     } else {
         None
     };
@@ -1258,8 +1321,8 @@ pub struct LoadedComponents<B: Backend> {
     pub talker: TalkerModel<B>,
     pub code_predictor: CodePredictor<B>,
     pub decoder: Decoder12Hz<B>,
-    pub encoder: Encoder12Hz<B>,
-    pub speaker_encoder: Option<SpeakerEncoder<B>>,
+    pub encoder: Encoder12Hz<burn::backend::NdArray>,
+    pub speaker_encoder: Option<SpeakerEncoder<burn::backend::NdArray>>,
     pub model_type: Option<crate::models::config::ModelType>,
 }
 

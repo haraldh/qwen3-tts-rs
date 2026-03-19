@@ -125,9 +125,9 @@ pub struct Qwen3TTS<B: Backend> {
     talker: TalkerModel<B>,
     code_predictor: CodePredictor<B>,
     decoder: Decoder12Hz<B>,
-    encoder: Encoder12Hz<B>,
+    encoder: Encoder12Hz<burn::backend::NdArray>,
     text_tokenizer: tokenizer::TextTokenizer,
-    speaker_encoder: Option<SpeakerEncoder<B>>,
+    speaker_encoder: Option<SpeakerEncoder<burn::backend::NdArray>>,
     rope: RoPEType<B>,
     cp_rope: RoPEType<B>,
     model_type: Option<ModelType>,
@@ -200,9 +200,9 @@ impl<B: Backend> Qwen3TTS<B> {
         talker: TalkerModel<B>,
         code_predictor: CodePredictor<B>,
         decoder: Decoder12Hz<B>,
-        encoder: Encoder12Hz<B>,
+        encoder: Encoder12Hz<burn::backend::NdArray>,
         text_tokenizer: tokenizer::TextTokenizer,
-        speaker_encoder: Option<SpeakerEncoder<B>>,
+        speaker_encoder: Option<SpeakerEncoder<burn::backend::NdArray>>,
         model_type: Option<ModelType>,
         device: B::Device,
     ) -> Self {
@@ -512,7 +512,17 @@ impl<B: Backend> Qwen3TTS<B> {
             ref_audio
         };
 
-        let speaker_embedding = speaker_enc.encode(ref_audio, &self.device);
+        // Run speaker encoder on CPU (avoids CubeCL autotune crashes on HIP BF16)
+        let cpu_device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let cpu_embedding = speaker_enc.encode(ref_audio, &cpu_device);
+        // Transfer to main backend and cast to native dtype.
+        // from_data() preserves the source F32 dtype; without an explicit cast,
+        // the F32 speaker embedding creates mixed-dtype ops with BF16 tensors
+        // downstream, producing garbage on ROCm.
+        let native_dtype: burn::tensor::FloatDType =
+            self.talker.codec_embedding.weight.val().dtype().into();
+        let speaker_embedding =
+            Tensor::<B, 1>::from_data(cpu_embedding.into_data(), &self.device).cast(native_dtype);
 
         if let Some(ref_text) = ref_text {
             // ICL mode: encode reference audio to codec codes + tokenize ref text
@@ -577,7 +587,6 @@ impl<B: Backend> Qwen3TTS<B> {
             .clone()
             .unsqueeze_dim::<2>(0)
             .unsqueeze_dim::<3>(0); // [1, 1, enc_dim]
-
         let max_seq = input_ids.len() + 256 + gen_config.max_new_tokens;
         let mut kv_caches = self.talker.new_kv_caches(max_seq, &self.device);
         let (hidden, logits) = self.talker.prefill_voice_clone(
@@ -679,10 +688,18 @@ impl<B: Backend> Qwen3TTS<B> {
         let n_frames = ref_codes.len();
         assert!(n_frames > 0, "ref_codes must not be empty");
 
+        // Accumulate in F32 to avoid BF16 rounding errors compounding over 16 additions.
+        // On BF16 backends, each addition truncates to 8-bit mantissa; after 16 steps
+        // the embedding is significantly corrupted, producing garbage ICL output.
+        let orig_dtype = self.talker.codec_embedding.weight.val().dtype();
+
         // Group 0: semantic codes → talker.codec_embedding
         let semantic_ids: Vec<i32> = ref_codes.iter().map(|f| f[0] as i32).collect();
         let semantic_tensor = Tensor::<B, 1, Int>::from_ints(semantic_ids.as_slice(), &self.device);
-        let mut summed = self.talker.get_codec_embedding_batch(semantic_tensor); // [1, T, hidden]
+        let mut summed = self
+            .talker
+            .get_codec_embedding_batch(semantic_tensor)
+            .cast(burn::tensor::FloatDType::F32); // [1, T, hidden] in F32
 
         // Groups 1-15: acoustic codes → code_predictor.embed_codes_for_group
         for group in 1..16 {
@@ -690,11 +707,14 @@ impl<B: Backend> Qwen3TTS<B> {
             let group_tensor = Tensor::<B, 1, Int>::from_ints(group_ids.as_slice(), &self.device);
             let group_embed = self
                 .code_predictor
-                .embed_codes_for_group(group - 1, group_tensor); // [1, T, embed_dim]
+                .embed_codes_for_group(group - 1, group_tensor)
+                .cast(burn::tensor::FloatDType::F32); // upcast to F32
             summed = summed + group_embed;
         }
 
-        summed
+        // Cast back to native dtype
+        let native_dtype: burn::tensor::FloatDType = orig_dtype.into();
+        summed.cast(native_dtype)
     }
 
     /// Convert frame codes to tensor [1, 16, T] for the decoder.
