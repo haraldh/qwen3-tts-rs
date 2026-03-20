@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::mpsc as std_mpsc;
 use tokio::sync::mpsc as tokio_mpsc;
 
-use qwen3_tts::{Language, Speaker, SynthesisOptions};
+use qwen3_tts::{AudioBuffer, Language, Speaker, SynthesisOptions, VoiceClonePrompt};
 
 // ── Backend selection ────────────────────────────────────────────────────
 
@@ -89,6 +89,18 @@ struct Args {
     /// Use streaming synthesis (per-chunk decode; may have boundary artifacts)
     #[arg(long)]
     streaming: bool,
+
+    /// Reference audio file for voice cloning (Base models only)
+    #[arg(long)]
+    ref_audio: Option<String>,
+
+    /// Reference text transcript (required with --ref-audio for ICL mode)
+    #[arg(long)]
+    ref_text: Option<String>,
+
+    /// Language for voice cloning
+    #[arg(long, default_value = "english")]
+    language: String,
 }
 
 // ── Audio format ─────────────────────────────────────────────────────────
@@ -127,6 +139,7 @@ struct SynthesisRequest {
     options: SynthesisOptions,
     format: AudioFormat,
     streaming: bool,
+    voice_clone: bool,
     response_tx: tokio_mpsc::Sender<Result<Vec<u8>, String>>,
 }
 
@@ -199,12 +212,24 @@ fn resolve_voice(name: &str) -> Result<Speaker, String> {
 
 // ── App state ────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
 struct AppState {
     command_tx: std_mpsc::SyncSender<SynthesisRequest>,
     default_language: Language,
     default_options: SynthesisOptions,
     streaming: bool,
+    voice_clone: bool,
+}
+
+impl Clone for AppState {
+    fn clone(&self) -> Self {
+        Self {
+            command_tx: self.command_tx.clone(),
+            default_language: self.default_language,
+            default_options: self.default_options.clone(),
+            streaming: self.streaming,
+            voice_clone: self.voice_clone,
+        }
+    }
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────
@@ -304,6 +329,7 @@ async fn speech_handler(State(state): State<AppState>, Json(req): Json<SpeechReq
         options,
         format,
         streaming: state.streaming,
+        voice_clone: state.voice_clone,
         response_tx,
     };
 
@@ -331,10 +357,11 @@ async fn speech_handler(State(state): State<AppState>, Json(req): Json<SpeechReq
 
 fn run_model_thread(
     model: qwen3_tts::Qwen3TTS<SelectedBackend>,
+    voice_clone_prompt: Option<VoiceClonePrompt<SelectedBackend>>,
     rx: std_mpsc::Receiver<SynthesisRequest>,
 ) {
     while let Ok(req) = rx.recv() {
-        let result = process_request(&model, &req);
+        let result = process_request(&model, voice_clone_prompt.as_ref(), &req);
         if let Err(e) = result {
             let _ = req.response_tx.blocking_send(Err(e));
         }
@@ -343,14 +370,26 @@ fn run_model_thread(
 
 fn process_request(
     model: &qwen3_tts::Qwen3TTS<SelectedBackend>,
+    voice_clone_prompt: Option<&VoiceClonePrompt<SelectedBackend>>,
     req: &SynthesisRequest,
 ) -> Result<(), String> {
     eprintln!(
-        "Synthesizing: speaker={:?} lang={:?} streaming={} text={:?}",
-        req.speaker, req.language, req.streaming, &req.text
+        "Synthesizing: voice_clone={} lang={:?} streaming={} text={:?}",
+        req.voice_clone, req.language, req.streaming, &req.text
     );
     let t0 = std::time::Instant::now();
-    let audio = if req.streaming {
+    let audio = if req.voice_clone {
+        let prompt = voice_clone_prompt
+            .ok_or("Voice clone prompt not configured")?;
+        model
+            .synthesize_voice_clone(
+                &req.text,
+                prompt,
+                req.language,
+                Some(req.options.clone()),
+            )
+            .map_err(|e| e.to_string())?
+    } else if req.streaming {
         let mut session = model
             .synthesize_streaming(&req.text, req.speaker, req.language, req.options.clone())
             .map_err(|e| e.to_string())?;
@@ -358,7 +397,7 @@ fn process_request(
         while let Some(chunk) = session.next_chunk().map_err(|e| e.to_string())? {
             all_samples.extend_from_slice(&chunk.samples);
         }
-        qwen3_tts::AudioBuffer::new(all_samples, 24000)
+        AudioBuffer::new(all_samples, 24000)
     } else {
         model
             .synthesize_with_voice(
@@ -400,15 +439,10 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Validate default speaker arg early (used for documentation, could be a future fallback)
-    let _: Speaker = args
-        .default_speaker
-        .parse()
-        .expect("Invalid default speaker");
     let default_language: Language = args
-        .default_language
+        .language
         .parse()
-        .expect("Invalid default language");
+        .expect("Invalid language");
 
     // Load model
     eprintln!("Loading model from {}...", args.model_dir);
@@ -420,11 +454,29 @@ fn main() -> Result<()> {
     )?;
     eprintln!("Model loaded.");
 
+    // Pre-compute voice clone prompt if --ref-audio provided
+    let voice_clone_prompt = if let Some(ref ref_audio_path) = args.ref_audio {
+        eprintln!("Loading reference audio from {ref_audio_path}...");
+        let ref_audio = qwen3_tts::AudioBuffer::load(ref_audio_path)?;
+        let prompt = model.create_voice_clone_prompt(
+            &ref_audio,
+            args.ref_text.as_deref(),
+        )?;
+        eprintln!(
+            "Voice clone prompt ready (ICL={})",
+            prompt.ref_codes.is_some()
+        );
+        Some(prompt)
+    } else {
+        None
+    };
+    let voice_clone = voice_clone_prompt.is_some();
+
     // Create channel (bounded to prevent unbounded queue)
     let (command_tx, command_rx) = std_mpsc::sync_channel::<SynthesisRequest>(16);
 
     // Spawn model thread
-    std::thread::spawn(move || run_model_thread(model, command_rx));
+    std::thread::spawn(move || run_model_thread(model, voice_clone_prompt, command_rx));
 
     let default_options = SynthesisOptions {
         temperature: args.temperature,
@@ -440,6 +492,7 @@ fn main() -> Result<()> {
         default_language,
         default_options,
         streaming: args.streaming,
+        voice_clone,
     };
 
     let app = Router::new()
