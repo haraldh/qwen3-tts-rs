@@ -9,6 +9,7 @@ use std::ffi::{c_char, CString};
 pub(crate) struct HipKernels {
     pub module: hipModule_t,
     pub gemv: hipFunction_t,
+    pub gemv_int4: hipFunction_t,
     pub rmsnorm: hipFunction_t,
     pub qk_norm_rope: hipFunction_t,
     pub kv_cache_append: hipFunction_t,
@@ -437,6 +438,68 @@ extern "C" __global__ void embedding_gather_add_bf16(
     output[i] = val;
     acc[i] = f32_to_bf16(bf16_to_f32(acc[i]) + bf16_to_f32(val));
 }
+
+// ============ GEMV Int4 (asymmetric) ============
+// y[j] = sum_i dequant(W_int4[j,i]) * x[i]  (+bias if non-null)
+// Asymmetric dequant: w = (q - zero) * scale
+// W_int4 packed: 8 unsigned int4 [0..15] per u32, LSB-first.
+// scales/zeros: per-group f32, one per GROUP_SIZE elements.
+// Grid: N blocks, Block: 256 threads
+#define GEMV_INT4_BLOCK 256
+#define GEMV_INT4_GROUP 64
+
+extern "C" __global__ void gemv_int4(
+    const bf16* __restrict__ x,
+    const unsigned int* __restrict__ W,
+    bf16* __restrict__ y,
+    const bf16* __restrict__ bias,
+    const float* __restrict__ scales,
+    const float* __restrict__ zeros,
+    int K, int N)
+{
+    __shared__ float shared[GEMV_INT4_BLOCK];
+    int j = blockIdx.x;
+    int tid = threadIdx.x;
+
+    if (j >= N) return;
+
+    float sum = 0.0f;
+    int K8 = K / 8;
+    int num_groups = K / GEMV_INT4_GROUP;
+    const unsigned int* row = W + (long long)j * K8;
+    const float* row_scales = scales + (long long)j * num_groups;
+    const float* row_zeros = zeros + (long long)j * num_groups;
+
+    for (int u = tid; u < K8; u += GEMV_INT4_BLOCK) {
+        unsigned int packed = row[u];
+        int base_i = u * 8;
+        int group_idx = base_i / GEMV_INT4_GROUP;
+        float scale = row_scales[group_idx];
+        float zero = row_zeros[group_idx];
+
+        for (int b = 0; b < 8; b++) {
+            int q = (packed >> (b * 4)) & 0xF;  // unsigned [0, 15]
+            float w = ((float)q - zero) * scale;
+            sum += w * bf16_to_f32(x[base_i + b]);
+        }
+    }
+
+    shared[tid] = sum;
+    __syncthreads();
+
+    for (int s = GEMV_INT4_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float result = shared[0];
+        if (bias != nullptr) {
+            result += bf16_to_f32(bias[j]);
+        }
+        y[j] = f32_to_bf16(result);
+    }
+}
 "#;
 
 impl HipKernels {
@@ -512,6 +575,7 @@ impl HipKernels {
         Ok(Self {
             module,
             gemv: get_fn("gemv_bf16")?,
+            gemv_int4: get_fn("gemv_int4")?,
             rmsnorm: get_fn("rmsnorm_bf16")?,
             qk_norm_rope: get_fn("qk_norm_rope_bf16")?,
             kv_cache_append: get_fn("kv_cache_append_bf16")?,

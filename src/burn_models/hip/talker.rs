@@ -19,14 +19,17 @@ use crate::burn_models::transformer::RoPEType;
 use super::code_predictor::{div_ceil, hip_check, hip_d2h, hip_h2d, ptr_of, GpuAlloc, StreamGuard};
 
 /// Per-layer weight pointers (all on GPU, BF16).
+use super::code_predictor::WeightPtr;
+
+/// Per-layer weight pointers (on GPU).
 struct LayerWeights {
-    q_weight: *mut c_void,
-    k_weight: *mut c_void,
-    v_weight: *mut c_void,
-    o_weight: *mut c_void,
-    gate_weight: *mut c_void,
-    up_weight: *mut c_void,
-    down_weight: *mut c_void,
+    q_weight: WeightPtr,
+    k_weight: WeightPtr,
+    v_weight: WeightPtr,
+    o_weight: WeightPtr,
+    gate_weight: WeightPtr,
+    up_weight: WeightPtr,
+    down_weight: WeightPtr,
     input_ln: *mut c_void,
     post_ln: *mut c_void,
     q_norm: *mut c_void,
@@ -120,41 +123,41 @@ impl HipTalker {
             let a = &la.self_attn;
             let m = &la.mlp;
             layers.push(LayerWeights {
-                q_weight: ga.upload_transposed(
+                q_weight: WeightPtr::Bf16(ga.upload_transposed(
                     &a.q_proj.weight.val().into_data(),
                     hidden_size,
                     q_dim,
-                ),
-                k_weight: ga.upload_transposed(
+                )),
+                k_weight: WeightPtr::Bf16(ga.upload_transposed(
                     &a.k_proj.weight.val().into_data(),
                     hidden_size,
                     kv_dim,
-                ),
-                v_weight: ga.upload_transposed(
+                )),
+                v_weight: WeightPtr::Bf16(ga.upload_transposed(
                     &a.v_proj.weight.val().into_data(),
                     hidden_size,
                     kv_dim,
-                ),
-                o_weight: ga.upload_transposed(
+                )),
+                o_weight: WeightPtr::Bf16(ga.upload_transposed(
                     &a.o_proj.weight.val().into_data(),
                     q_dim,
                     hidden_size,
-                ),
-                gate_weight: ga.upload_transposed(
+                )),
+                gate_weight: WeightPtr::Bf16(ga.upload_transposed(
                     &m.gate_proj.weight.val().into_data(),
                     hidden_size,
                     intermediate_size,
-                ),
-                up_weight: ga.upload_transposed(
+                )),
+                up_weight: WeightPtr::Bf16(ga.upload_transposed(
                     &m.up_proj.weight.val().into_data(),
                     hidden_size,
                     intermediate_size,
-                ),
-                down_weight: ga.upload_transposed(
+                )),
+                down_weight: WeightPtr::Bf16(ga.upload_transposed(
                     &m.down_proj.weight.val().into_data(),
                     intermediate_size,
                     hidden_size,
-                ),
+                )),
                 input_ln: ga.upload(&la.input_layernorm.gamma.val().into_data()),
                 post_ln: ga.upload(&la.post_attention_layernorm.gamma.val().into_data()),
                 q_norm: ga.upload(&a.q_norm.gamma.val().into_data()),
@@ -291,6 +294,62 @@ impl HipTalker {
         }
     }
 
+    /// Replace BF16 layer weights with int4 packed weights from a quantized file.
+    ///
+    /// Frees old BF16 weight buffers and uploads int4 packed + scales from the
+    /// safetensors file. Non-quantized weights (norms, codec_head) are unaffected.
+    pub fn load_int4_weights(
+        &mut self,
+        int4_file: &crate::burn_models::weight_loader::Int4SafeTensors,
+    ) -> Result<(), String> {
+        let t0 = std::time::Instant::now();
+        let mut ga = GpuAlloc::new();
+        let mut replaced = 0usize;
+
+        for (l, lw) in self.layers.iter_mut().enumerate() {
+            let prefix = format!("talker.model.layers.{l}");
+            let projs = [
+                (&mut lw.q_weight, "self_attn.q_proj.weight"),
+                (&mut lw.k_weight, "self_attn.k_proj.weight"),
+                (&mut lw.v_weight, "self_attn.v_proj.weight"),
+                (&mut lw.o_weight, "self_attn.o_proj.weight"),
+                (&mut lw.gate_weight, "mlp.gate_proj.weight"),
+                (&mut lw.up_weight, "mlp.up_proj.weight"),
+                (&mut lw.down_weight, "mlp.down_proj.weight"),
+            ];
+            for (weight_ptr, suffix) in projs {
+                let int4_key = format!("{prefix}.{suffix}_int4");
+                let scales_key = format!("{prefix}.{suffix}_scales");
+                let zeros_key = format!("{prefix}.{suffix}_zeros");
+                if int4_file.has_key(&int4_key) {
+                    let packed_bytes =
+                        int4_file.raw_bytes(&int4_key).map_err(|e| e.to_string())?;
+                    let scale_bytes =
+                        int4_file.raw_bytes(&scales_key).map_err(|e| e.to_string())?;
+                    let zeros_bytes =
+                        int4_file.raw_bytes(&zeros_key).map_err(|e| e.to_string())?;
+                    // Free old BF16 buffer
+                    if let WeightPtr::Bf16(old) = *weight_ptr {
+                        unsafe { cubecl_hip_sys::hipFree(old) };
+                    }
+                    *weight_ptr = ga.upload_int4_weight(packed_bytes, scale_bytes, zeros_bytes);
+                    replaced += 1;
+                }
+            }
+        }
+
+        // Track new allocations (ownership moves to self.all_allocs)
+        self.all_allocs.extend(ga.ptrs);
+
+        tracing::info!(
+            "Loaded int4 weights for HIP talker: {} projections replaced ({:.1}MB) in {:.0}ms",
+            replaced,
+            ga.total_bytes as f64 / 1_048_576.0,
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+        Ok(())
+    }
+
     /// Run one decode step: input → 28 layers → norm → codec_head → logits.
     ///
     /// Takes BF16 bytes of shape [hidden_size], returns (last_hidden_bytes, logits_bytes).
@@ -305,9 +364,9 @@ impl HipTalker {
         // Run all layers
         self.forward_one_token(offset);
 
-        // codec_head: normed_buf → logits_buf
+        // codec_head: normed_buf → logits_buf (always BF16, not quantized)
         self.launch_gemv(
-            self.codec_head_weight,
+            WeightPtr::Bf16(self.codec_head_weight),
             self.normed_buf,
             self.logits_buf,
             self.codec_vocab_size,
@@ -441,28 +500,63 @@ impl HipTalker {
 
     fn launch_gemv(
         &self,
-        weight: *mut c_void,
+        weight: WeightPtr,
         input: *mut c_void,
         output: *mut c_void,
         n: usize,
         k: usize,
         bias: *mut c_void,
     ) {
-        let mut p_input = input;
-        let mut p_weight = weight;
-        let mut p_output = output;
-        let mut p_bias = bias;
-        let mut k_i32 = k as i32;
-        let mut n_i32 = n as i32;
-        let mut args: [*mut c_void; 6] = [
-            ptr_of(&mut p_input),
-            ptr_of(&mut p_weight),
-            ptr_of(&mut p_output),
-            ptr_of(&mut p_bias),
-            ptr_of(&mut k_i32),
-            ptr_of(&mut n_i32),
-        ];
-        self.launch_kernel(self.kernels.gemv, n as u32, 1, 1, 256, 1, 1, 0, &mut args);
+        match weight {
+            WeightPtr::Bf16(w) => {
+                let mut p_input = input;
+                let mut p_weight = w;
+                let mut p_output = output;
+                let mut p_bias = bias;
+                let mut k_i32 = k as i32;
+                let mut n_i32 = n as i32;
+                let mut args: [*mut c_void; 6] = [
+                    ptr_of(&mut p_input),
+                    ptr_of(&mut p_weight),
+                    ptr_of(&mut p_output),
+                    ptr_of(&mut p_bias),
+                    ptr_of(&mut k_i32),
+                    ptr_of(&mut n_i32),
+                ];
+                self.launch_kernel(self.kernels.gemv, n as u32, 1, 1, 256, 1, 1, 0, &mut args);
+            }
+            WeightPtr::Int4 { packed, scales, zeros } => {
+                let mut p_input = input;
+                let mut p_packed = packed;
+                let mut p_output = output;
+                let mut p_bias = bias;
+                let mut p_scales = scales;
+                let mut p_zeros = zeros;
+                let mut k_i32 = k as i32;
+                let mut n_i32 = n as i32;
+                let mut args: [*mut c_void; 8] = [
+                    ptr_of(&mut p_input),
+                    ptr_of(&mut p_packed),
+                    ptr_of(&mut p_output),
+                    ptr_of(&mut p_bias),
+                    ptr_of(&mut p_scales),
+                    ptr_of(&mut p_zeros),
+                    ptr_of(&mut k_i32),
+                    ptr_of(&mut n_i32),
+                ];
+                self.launch_kernel(
+                    self.kernels.gemv_int4,
+                    n as u32,
+                    1,
+                    1,
+                    256,
+                    1,
+                    1,
+                    0,
+                    &mut args,
+                );
+            }
+        }
     }
 
     fn launch_rmsnorm(
@@ -703,9 +797,9 @@ impl HipTalker {
         // Run all layers
         self.forward_one_token(offset);
 
-        // codec_head: normed_buf → logits_buf
+        // codec_head: normed_buf → logits_buf (always BF16, not quantized)
         self.launch_gemv(
-            self.codec_head_weight,
+            WeightPtr::Bf16(self.codec_head_weight),
             self.normed_buf,
             self.logits_buf,
             self.codec_vocab_size,

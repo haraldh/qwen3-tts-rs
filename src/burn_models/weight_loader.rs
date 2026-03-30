@@ -1248,8 +1248,10 @@ fn load_speaker_encoder<B: Backend>(
 /// ```
 pub fn load_all<B: Backend>(model_dir: &Path, device: &B::Device) -> Result<LoadedComponents<B>> {
     let config_path = model_dir.join("config.json");
+    let int4_path = model_dir.join("model_int4.safetensors");
     let model_path = model_dir.join("model.safetensors");
     let st_path = model_dir.join("speech_tokenizer/model.safetensors");
+    let has_int4 = int4_path.exists();
 
     // Parse config
     let parsed =
@@ -1306,6 +1308,10 @@ pub fn load_all<B: Backend>(model_dir: &Path, device: &B::Device) -> Result<Load
         None
     };
 
+    if has_int4 {
+        tracing::info!("Int4 quantized weights available at {}", int4_path.display());
+    }
+
     Ok(LoadedComponents {
         talker,
         code_predictor,
@@ -1313,6 +1319,7 @@ pub fn load_all<B: Backend>(model_dir: &Path, device: &B::Device) -> Result<Load
         encoder,
         speaker_encoder,
         model_type: Some(parsed.model_type),
+        int4_weights_path: if has_int4 { Some(int4_path) } else { None },
     })
 }
 
@@ -1324,6 +1331,8 @@ pub struct LoadedComponents<B: Backend> {
     pub encoder: Encoder12Hz<burn::backend::NdArray>,
     pub speaker_encoder: Option<SpeakerEncoder<burn::backend::NdArray>>,
     pub model_type: Option<crate::models::config::ModelType>,
+    /// Path to int4 quantized weights (if model_int4.safetensors exists).
+    pub int4_weights_path: Option<std::path::PathBuf>,
 }
 
 /// Load a [`CodePredictor`] on the NdArray (CPU) backend from a model directory.
@@ -1339,4 +1348,53 @@ pub fn load_cpu_code_predictor(model_dir: &Path) -> Result<CodePredictor<burn::b
     let cp_config = CodePredictorConfig::from_parsed(&parsed);
     let device = Default::default();
     load_code_predictor(&model_path, cp_config, &device)
+}
+
+/// Raw tensor data from an int4 quantized safetensors file.
+///
+/// For quantized weights, the file contains `{key}_int4` (packed u32) and
+/// `{key}_scales` (f32). Non-quantized tensors are stored as-is (BF16/F32).
+pub struct Int4SafeTensors {
+    data: Vec<u8>,
+    header: HashMap<String, serde_json::Value>,
+}
+
+impl Int4SafeTensors {
+    /// Load an int4 safetensors file.
+    pub fn load(path: &Path) -> Result<Self> {
+        let data = std::fs::read(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let header_size = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
+        let header: HashMap<String, serde_json::Value> =
+            serde_json::from_slice(&data[8..8 + header_size])
+                .context("Failed to parse int4 safetensors header")?;
+        Ok(Self { data, header })
+    }
+
+    /// Get raw bytes for a tensor key.
+    pub fn raw_bytes(&self, key: &str) -> Result<&[u8]> {
+        let info = self.header.get(key)
+            .with_context(|| format!("Key not found in int4 safetensors: {key}"))?;
+        let offsets = info["data_offsets"].as_array()
+            .context("Missing data_offsets")?;
+        let start = offsets[0].as_u64().unwrap() as usize;
+        let end = offsets[1].as_u64().unwrap() as usize;
+        let header_size = u64::from_le_bytes(self.data[..8].try_into().unwrap()) as usize;
+        let base = 8 + header_size;
+        Ok(&self.data[base + start..base + end])
+    }
+
+    /// Check if a key exists.
+    pub fn has_key(&self, key: &str) -> bool {
+        self.header.contains_key(key)
+    }
+
+    /// Check if this file has int4 quantization metadata.
+    pub fn is_quantized(&self) -> bool {
+        if let Some(meta) = self.header.get("__metadata__") {
+            meta.get("quantization").is_some()
+        } else {
+            false
+        }
+    }
 }

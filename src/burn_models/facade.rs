@@ -180,7 +180,7 @@ impl<B: Backend> Qwen3TTS<B> {
         // Load all model components
         let components = super::weight_loader::load_all(model_path, &device)?;
 
-        let tts = Self::build_from_components(
+        let mut tts = Self::build_from_components(
             components.talker,
             components.code_predictor,
             components.decoder,
@@ -190,6 +190,25 @@ impl<B: Backend> Qwen3TTS<B> {
             components.model_type,
             device,
         );
+
+        // Load int4 quantized weights into HIP components if available
+        #[cfg(feature = "rocm")]
+        if let Some(ref int4_path) = components.int4_weights_path {
+            if let Ok(int4_file) =
+                crate::burn_models::weight_loader::Int4SafeTensors::load(int4_path)
+            {
+                if let Some(ref mut hip_talker) = tts.hip_talker {
+                    if let Err(e) = hip_talker.load_int4_weights(&int4_file) {
+                        tracing::warn!("Failed to load int4 talker weights: {e}");
+                    }
+                }
+                if let Some(ref mut hip_cp) = tts.hip_cp {
+                    if let Err(e) = hip_cp.load_int4_weights(&int4_file) {
+                        tracing::warn!("Failed to load int4 code predictor weights: {e}");
+                    }
+                }
+            }
+        }
 
         Ok(tts)
     }
@@ -775,7 +794,11 @@ impl<B: Backend> Qwen3TTS<B> {
             .convert::<f32>()
             .to_vec()
             .unwrap();
-        Ok(AudioBuffer::new(samples[..num_samples].to_vec(), 24000))
+        // Pad 50ms silence to prevent last-syllable clipping from early EOS
+        let pad_samples = 24000 / 20; // 50ms at 24kHz = 1200 samples
+        let mut padded = samples[..num_samples].to_vec();
+        padded.extend(std::iter::repeat(0.0f32).take(pad_samples));
+        Ok(AudioBuffer::new(padded, 24000))
     }
 
     // ── Private helpers ──────────────────────────────────────────────────
