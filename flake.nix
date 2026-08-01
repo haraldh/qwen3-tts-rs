@@ -2,7 +2,13 @@
   description = "qwen3-tts-rs dev shell with AMD ROCm";
 
   inputs = {
-    unstable.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # Pinned to the exact revision nixcfg builds against, so the dev shell and
+    # the nixcfg package (pkgs.metacfg.qwen3-tts-rs) use one ROCm. Drifting
+    # apart means developing against a different HIP than we deploy: this rev
+    # ships clr 7.2.3 / HIP patch 53211, whereas nixpkgs-unstable was on 7.2.0
+    # / 53210, and cubecl-hip-sys selects its bindings by that patch number.
+    # Bump in lockstep with nixcfg's flake.lock `nixpkgs` entry.
+    unstable.url = "github:NixOS/nixpkgs/21ea275a7c46aef9d4d6ddc962e6d562e9d94183";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -48,7 +54,7 @@
             cmake
             ninja
             python3
-            mold-wrapped      # Fast linker
+            mold              # Fast linker
           ];
 
           buildInputs = with pkgs; [
@@ -90,9 +96,16 @@
 
             # Vulkan: use Mesa RADV ICD from this flake's nixpkgs
             export LD_LIBRARY_PATH="${pkgs.vulkan-loader}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            export VK_ICD_FILENAMES="${pkgs.mesa.drivers}/share/vulkan/icd.d/radeon_icd.x86_64.json"
+            export VK_ICD_FILENAMES="${pkgs.mesa}/share/vulkan/icd.d/radeon_icd.x86_64.json"
 
-            # Strix Halo iGPU = gfx1151 (RDNA 3.5)
+            # Strix Halo iGPU = gfx1151 (RDNA 3.5). The raw HIP kernels in
+            # src/burn_models/hip are compiled at RUNTIME through HIPRTC, which
+            # does not infer the target from the current device — without this
+            # the kernels fail to compile at first synthesis, not at build time.
+            # Anything running outside this shell (a systemd unit, a container)
+            # must set it too.
+            export HIPRTC_COMPILE_OPTIONS_APPEND="--offload-arch=gfx1151"
+
             # If ROCm doesn't recognize the exact GFX version, override to nearest supported:
             # export HSA_OVERRIDE_GFX_VERSION="11.5.1"
 
