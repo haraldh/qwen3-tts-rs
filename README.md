@@ -73,11 +73,6 @@ request after boot is dramatically slower than the rest. Warm it up before servi
 **Quality check**: transcribing the output with whisper large-v3 returns the input sentence
 verbatim — 100% word overlap (`scripts/verify_audio.py`, see [CLAUDE.md](CLAUDE.md)).
 
-> **Note on the sections below.** Everything from *Performance* onward is inherited from upstream and
-> describes the candle/CUDA build: the benchmark table is from an NVIDIA DGX Spark, and the feature
-> table lists `flash-attn`, `metal`, `mkl` and `accelerate`, none of which exist in this fork's
-> `Cargo.toml`. See [CLAUDE.md](CLAUDE.md) for the feature flags that actually exist.
-
 ## Changelog
 
 ### 0.4.0
@@ -114,39 +109,11 @@ Thanks to [u/rngesius](https://www.reddit.com/r/LocalLLaMA/comments/1qqvb79/comm
 ## Acknowledgements
 
 - [Qwen Team (Alibaba)](https://github.com/QwenLM) — [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) model, weights, and [technical report](https://arxiv.org/abs/2601.15621)
-- [candle](https://github.com/huggingface/candle) — Rust ML framework by [Hugging Face](https://huggingface.co/)
+- [TrevorS/qwen3-tts-rs](https://github.com/TrevorS/qwen3-tts-rs) — the upstream this forked from
+- [Burn](https://burn.dev), [CubeCL and cubek](https://github.com/tracel-ai) — Rust ML framework and GPU kernel stack by [Tracel AI](https://tracel.ai/), which this fork's model code runs on
+- [candle](https://github.com/huggingface/candle) — Rust ML framework by [Hugging Face](https://huggingface.co/), used by the legacy `src/models/` stack
 - [mlx-audio](https://github.com/Blaizzy/mlx-audio) — reference implementation that helped clarify model details
 - [Claude Code](https://claude.ai/code) — wrote the code
-
-## Features
-
-- **CPU inference** with optional MKL/Accelerate for faster BLAS operations
-- **CUDA** support for NVIDIA GPU acceleration with **bf16** and **Flash Attention 2**
-- **Metal** support for Apple Silicon
-- **Streaming synthesis** for low-latency audio output
-- **Voice cloning** via x-vector or ICL (in-context learning) from reference audio (Base models)
-- **Preset speakers** with 9 built-in voices (CustomVoice models)
-- **Text-described voices** via natural language prompts (VoiceDesign models)
-- **Auto-detection** of model variant from `config.json`
-- **HuggingFace Hub integration** for easy model downloads
-
-## Performance
-
-Benchmarked on an NVIDIA DGX Spark (GB10 Blackwell, ARM Cortex-X925, 120 GB unified memory).
-Default generation parameters, seed 42, 2 warmup + 3 timed iterations.
-
-| Model | RTF (short) | RTF (long) | Tok/s | Memory |
-|-------|-------------|------------|-------|--------|
-| **0.6B Base (CUDA BF16)** | **0.48** | **0.50** | 25.9 | 767 MB |
-| **1.7B Base (CUDA BF16)** | **0.65** | **0.65** | 19.4 | 767 MB |
-| **1.7B CustomVoice (CUDA BF16)** | **0.64** | **0.67** | 19.2 | 772 MB |
-| **1.7B VoiceDesign (CUDA BF16)** | **0.64** | **0.66** | 19.3 | 770 MB |
-| 1.7B CustomVoice (CPU F32) | 5.39 | 6.48 | 2.1 | 9.1 GB |
-
-RTF (real-time factor) = wall-clock / audio duration. **< 1.0 is faster than real-time.**
-Non-streaming results shown above. Streaming adds ~8-12% overhead with TTFA ~444 ms (0.6B) / ~580 ms (1.7B).
-
-See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for full results, test corpus, micro-benchmarks, and reproduction instructions.
 
 ## Samples
 
@@ -196,7 +163,7 @@ Five official model variants exist across two size classes. Each variant support
 
 ### Which model should I use?
 
-- **Want to clone a specific voice?** Use a **Base** model with `--ref-audio` (ICL mode) or `--ref-audio --x-vector-only` (faster, lower quality).
+- **Want to clone a specific voice?** Use a **Base** model with `--ref-audio` plus `--ref-text` (ICL mode, best quality), or `--ref-audio` alone for speaker-embedding-only cloning (faster, lower quality).
 - **Want a quick preset voice?** Use a **CustomVoice** model with `--speaker`.
 - **Want to describe a voice in text?** Use **1.7B VoiceDesign** with `--instruct`.
 - **Unsure?** Start with **0.6B CustomVoice** for the fastest results.
@@ -210,169 +177,6 @@ Five official model variants exist across two size classes. Each variant support
 | **VoiceDesign** | | | | x |
 
 Using the wrong combination (e.g. preset speakers on a Base model) won't crash, but produces unpredictable voice output. The library and CLI warn when this happens.
-
-## Installation
-
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-qwen3-tts = { version = "0.1", features = ["hub"] }
-```
-
-### Feature Flags
-
-| Feature | Description |
-|---------|-------------|
-| `cpu` (default) | CPU inference |
-| `cuda` | NVIDIA GPU acceleration |
-| `flash-attn` | Flash Attention 2 (requires CUDA toolkit; enables bf16 compute) |
-| `metal` | Apple Silicon GPU acceleration |
-| `mkl` | Intel MKL for faster CPU inference |
-| `accelerate` | Apple Accelerate framework |
-| `hub` | HuggingFace Hub model downloads |
-| `cli` | Command-line tools |
-
-## Quick Start
-
-### Preset speakers (CustomVoice)
-
-```rust
-use qwen3_tts::{Qwen3TTS, Speaker, Language, auto_device};
-
-fn main() -> anyhow::Result<()> {
-    let device = auto_device()?;
-    let model = Qwen3TTS::from_pretrained("path/to/customvoice_model", device)?;
-
-    let audio = model.synthesize_with_voice(
-        "Hello, world!",
-        Speaker::Ryan,
-        Language::English,
-        None,
-    )?;
-    audio.save("output.wav")?;
-    Ok(())
-}
-```
-
-Available speakers: `Serena`, `Vivian`, `UncleFu`, `Ryan`, `Aiden`, `OnoAnna`, `Sohee`, `Eric`, `Dylan`
-
-### Voice cloning (Base)
-
-```rust
-use qwen3_tts::{Qwen3TTS, Language, AudioBuffer, auto_device};
-
-fn main() -> anyhow::Result<()> {
-    let device = auto_device()?;
-    let model = Qwen3TTS::from_pretrained("path/to/base_model", device)?;
-
-    // Load reference audio
-    let ref_audio = AudioBuffer::load("reference_voice.wav")?;
-
-    // ICL mode: full voice cloning with reference text
-    let prompt = model.create_voice_clone_prompt(&ref_audio, Some("transcript of ref audio"))?;
-
-    // x_vector_only: faster, speaker embedding only (no reference text needed)
-    // let prompt = model.create_voice_clone_prompt(&ref_audio, None)?;
-
-    let audio = model.synthesize_voice_clone(
-        "Hello in the cloned voice!",
-        &prompt,
-        Language::English,
-        None,
-    )?;
-    audio.save("cloned.wav")?;
-    Ok(())
-}
-```
-
-### Text-described voice (VoiceDesign)
-
-```rust
-use qwen3_tts::{Qwen3TTS, Language, auto_device};
-
-fn main() -> anyhow::Result<()> {
-    let device = auto_device()?;
-    let model = Qwen3TTS::from_pretrained("path/to/voicedesign_model", device)?;
-
-    let audio = model.synthesize_voice_design(
-        "Hello from a designed voice!",
-        "A cheerful young female voice with high pitch and energetic tone",
-        Language::English,
-        None,
-    )?;
-    audio.save("designed.wav")?;
-    Ok(())
-}
-```
-
-### With custom options
-
-```rust
-use qwen3_tts::{Qwen3TTS, SynthesisOptions, auto_device};
-
-fn main() -> anyhow::Result<()> {
-    let device = auto_device()?;
-    let model = Qwen3TTS::from_pretrained("path/to/model", device)?;
-
-    let options = SynthesisOptions {
-        temperature: 0.8,
-        top_k: 30,
-        top_p: 0.85,
-        repetition_penalty: 1.05,
-        ..Default::default()
-    };
-    let audio = model.synthesize("Custom settings!", Some(options))?;
-    audio.save("output.wav")?;
-    Ok(())
-}
-```
-
-### Streaming synthesis
-
-For low-latency applications, stream audio in chunks:
-
-```rust
-use qwen3_tts::{Qwen3TTS, Speaker, Language, SynthesisOptions, auto_device};
-
-fn main() -> anyhow::Result<()> {
-    let device = auto_device()?;
-    let model = Qwen3TTS::from_pretrained("path/to/model", device)?;
-
-    let options = SynthesisOptions {
-        chunk_frames: 10, // ~800ms per chunk
-        ..Default::default()
-    };
-
-    for chunk in model.synthesize_streaming(
-        "Hello, world!",
-        Speaker::Ryan,
-        Language::English,
-        options,
-    )? {
-        let audio = chunk?;
-        // Play or stream this chunk
-        println!("Got {} samples", audio.samples.len());
-    }
-    Ok(())
-}
-```
-
-### With HuggingFace Hub
-
-```rust
-use qwen3_tts::{Qwen3TTS, ModelPaths, auto_device};
-
-fn main() -> anyhow::Result<()> {
-    let paths = ModelPaths::download(None)?;
-    let device = auto_device()?;
-
-    let model = Qwen3TTS::from_paths(&paths, device)?;
-    let audio = model.synthesize("Hello from HuggingFace!", None)?;
-    audio.save("output.wav")?;
-    Ok(())
-}
-```
 
 ## Architecture
 
@@ -395,116 +199,67 @@ Text --> TalkerModel --> Semantic Token --> CodePredictor --> [16 codes] --> Dec
 
 The model variant is auto-detected from `config.json`. The CLI warns if your flags don't match the model type.
 
+The backend is chosen at compile time, not by a flag — build with `--features rocm` for the
+8060S. There is no `--device` option.
+
 ```bash
 # CustomVoice: preset speaker
-cargo run --release --features cli --bin generate_audio -- \
-  --model-dir path/to/customvoice \
+cargo run --release --features rocm,cli --bin generate_audio -- \
+  --model-dir test_data/models/0.6B-CustomVoice \
   --text "Hello world" \
   --speaker ryan \
   --language english \
+  --output /var/tmp/hello.wav
 
 # Base: voice cloning (ICL — best quality, requires reference text)
-cargo run --release --features cli --bin generate_audio -- \
-  --model-dir path/to/base \
+cargo run --release --features rocm,cli --bin generate_audio -- \
+  --model-dir test_data/models/0.6B-Base \
   --text "Hello world" \
   --ref-audio reference.wav \
   --ref-text "transcript of the reference audio"
 
-# Base: voice cloning (x_vector_only — faster, no transcript needed)
-cargo run --release --features cli --bin generate_audio -- \
-  --model-dir path/to/base \
+# Base: voice cloning without a transcript (speaker embedding only)
+cargo run --release --features rocm,cli --bin generate_audio -- \
+  --model-dir test_data/models/0.6B-Base \
   --text "Hello world" \
-  --ref-audio reference.wav \
-  --x-vector-only
+  --ref-audio reference.wav
 
 # VoiceDesign: describe the voice you want
-cargo run --release --features cli --bin generate_audio -- \
+cargo run --release --features rocm,cli --bin generate_audio -- \
   --model-dir path/to/voicedesign \
   --text "Hello world" \
   --instruct "A cheerful young female voice with high pitch and energetic tone" \
   --language english
 
-# Reproducible generation with fixed seed
-cargo run --release --features cli --bin generate_audio -- \
-  --model-dir path/to/model \
-  --text "Hello" \
-  --seed 42
+# Streaming: emit audio incrementally in ~800 ms chunks
+cargo run --release --features rocm,cli --bin generate_audio -- \
+  --model-dir test_data/models/0.6B-CustomVoice \
+  --text "Hello world" \
+  --streaming --chunk-frames 10
 ```
 
 ### CLI options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model-dir` | `test_data/model` | Path to model directory |
-| `--text` | `"Hello"` | Text to synthesize |
+| `--model-dir`, `-m` | `test_data/model` | Path to model directory |
+| `--text`, `-t` | `"Hello"` | Text to synthesize |
+| `--tokenizer-dir` | *model-dir* | Tokenizer directory, if separate |
 | `--speaker` | `ryan` | Preset speaker (CustomVoice only) |
 | `--language` | `english` | Target language |
 | `--instruct` | | Voice description for VoiceDesign models |
 | `--ref-audio` | | Reference audio WAV for voice cloning (Base only) |
-| `--ref-text` | | Reference transcript for ICL voice cloning (requires `--ref-audio`) |
-| `--x-vector-only` | | Speaker embedding only, no ICL (use with `--ref-audio`) |
-| `--output` | | Output WAV file path (overrides default naming) |
-| `--device` | `auto` | Device: `auto`, `cpu`, `cuda`, `cuda:N`, `metal` |
-| `--duration` | | Max duration in seconds (overrides --frames) |
-| `--frames` | `2048` | Max frames (~164s); generation stops at EOS |
-| `--temperature` | `0.7` | Sampling temperature |
-| `--top-k` | `50` | Top-k sampling |
+| `--ref-text` | | Reference transcript; enables ICL when used with `--ref-audio` |
+| `--output`, `-o` | `output.wav` | Output WAV file path |
+| `--streaming` | off | Emit audio incrementally |
+| `--chunk-frames` | `10` | Frames per streaming chunk (~800 ms) |
+| `--duration`, `-d` | | Max duration in seconds (overrides `--frames`) |
+| `--frames`, `-f` | `2048` | Max frames (~164 s); generation stops at EOS |
+| `--temperature` | `0.3` | Sampling temperature |
+| `--top-k` | `20` | Top-k sampling |
 | `--top-p` | `0.9` | Nucleus sampling threshold |
-| `--repetition-penalty` | `1.05` | Repetition penalty |
-| `--seed` | `42` | Random seed for reproducibility |
-
-## GPU Acceleration
-
-On CUDA devices, the talker and code predictor automatically run in **bf16** for lower memory usage and faster inference. The codec decoder and speaker encoder remain in f32 (convolutional, no attention).
-
-For best performance, build with Flash Attention 2 (requires CUDA toolkit in `PATH`):
-
-```bash
-cargo build --release --features flash-attn,cli
-```
-
-### Docker
-
-For GPU builds, use the build script which auto-detects your GPU architecture:
-
-```bash
-# Build GPU image (auto-detects compute capability)
-./build-docker.sh qwen3-tts flash-attn,cli
-
-# Build CPU-only image
-./build-docker.sh qwen3-tts-cpu cli
-```
-
-The script builds inside a running container with GPU access, ensuring correct PTX compilation for your exact hardware (Ampere, Ada, Hopper, Blackwell, etc.).
-
-Run inference:
-
-```bash
-docker run --gpus all \
-  -v /path/to/models:/models \
-  -v /path/to/output:/output \
-  qwen3-tts \
-    --model-dir /models/0.6b-customvoice \
-    --speaker ryan \
-    --text "Hello world, this is a test." \
-    --device cuda \
-    --output /output/hello.wav
-```
-
-For CPU-only builds without GPU access, use the Dockerfile directly:
-
-```bash
-docker build --build-arg FEATURES=cli --build-arg BASE=ubuntu:22.04 -t qwen3-tts-cpu .
-```
-
-### Dtype behavior
-
-| Component | CPU | CUDA/Metal | CUDA + flash-attn |
-|-----------|-----|------------|--------------------|
-| Talker (transformer) | F32 | BF16 | BF16 |
-| Code Predictor | F32 | BF16 | BF16 |
-| Codec Decoder | F32 | F32 | F32 |
-| Speaker Encoder | F32 | F32 | F32 |
+| `--repetition-penalty` | `1.2` | Repetition penalty (1.0 = disabled) |
+| `--seed`, `-s` | `42` | Random seed for reproducibility |
 
 ## Model Files
 
