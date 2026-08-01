@@ -164,7 +164,10 @@ struct SpeechRequest {
     #[allow(dead_code)]
     model: String,
     input: String,
-    voice: String,
+    /// Optional despite being required by OpenAI's schema: clients that only
+    /// ever use one voice routinely omit it, and rejecting them is unhelpful
+    /// when --default-speaker already says what to use.
+    voice: Option<String>,
     response_format: Option<String>,
     #[allow(dead_code)]
     speed: Option<f64>,
@@ -268,6 +271,7 @@ fn decode_ref_audio(encoded: &str, ref_text: Option<&str>) -> Result<RefVoice, S
 
 struct AppState {
     command_tx: std_mpsc::SyncSender<SynthesisRequest>,
+    default_speaker: Speaker,
     default_language: Language,
     default_options: SynthesisOptions,
     streaming: bool,
@@ -278,6 +282,7 @@ impl Clone for AppState {
     fn clone(&self) -> Self {
         Self {
             command_tx: self.command_tx.clone(),
+            default_speaker: self.default_speaker,
             default_language: self.default_language,
             default_options: self.default_options.clone(),
             streaming: self.streaming,
@@ -333,10 +338,13 @@ async fn speech_handler(State(state): State<AppState>, Json(req): Json<SpeechReq
         return error_response(StatusCode::BAD_REQUEST, "Field 'input' must not be empty");
     }
 
-    // Resolve voice
-    let speaker = match resolve_voice(&req.voice) {
-        Ok(s) => s,
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
+    // Resolve voice, falling back to --default-speaker when the client omits it
+    let speaker = match req.voice.as_deref() {
+        Some(v) => match resolve_voice(v) {
+            Ok(s) => s,
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
+        },
+        None => state.default_speaker,
     };
 
     // Resolve format
@@ -613,6 +621,7 @@ fn main() -> Result<()> {
 
     let state = AppState {
         command_tx,
+        default_speaker,
         default_language,
         default_options,
         streaming: args.streaming,
