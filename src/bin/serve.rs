@@ -101,6 +101,11 @@ struct Args {
     /// Language for voice cloning
     #[arg(long, default_value = "english")]
     language: String,
+
+    /// Skip the startup warmup synthesis. Warmup costs a few seconds at boot
+    /// but stops the first real request from paying CubeCL autotune.
+    #[arg(long)]
+    no_warmup: bool,
 }
 
 // ── Audio format ─────────────────────────────────────────────────────────
@@ -557,6 +562,39 @@ fn main() -> Result<()> {
         None
     };
     let voice_clone = voice_clone_prompt.is_some();
+
+    let default_speaker: Speaker = args.default_speaker.parse().unwrap_or(Speaker::Ryan);
+
+    // Absorb the one-off GPU costs before the socket opens, so the first real
+    // request isn't the one that pays them. CubeCL autotunes every new BF16
+    // convolution and matmul shape on first use, and the HIP kernels compile
+    // through HIPRTC — together worth tens of seconds. /health stays closed
+    // until this finishes, so an orchestrator won't route traffic here early.
+    if !args.no_warmup {
+        eprintln!("Warming up...");
+        let t0 = std::time::Instant::now();
+        let opts = SynthesisOptions {
+            max_length: 16, // just enough frames to touch every kernel
+            ..Default::default()
+        };
+        let warm = match voice_clone_prompt.as_ref() {
+            Some(prompt) => {
+                model.synthesize_voice_clone("Warming up.", prompt, default_language, Some(opts))
+            }
+            None => model.synthesize_with_voice(
+                "Warming up.",
+                default_speaker,
+                default_language,
+                Some(opts),
+            ),
+        };
+        match warm {
+            // Don't abort startup on a warmup failure — the server is still
+            // usable, it will just be slow on the first request.
+            Err(e) => eprintln!("Warmup failed (continuing): {e}"),
+            Ok(_) => eprintln!("Warmed up in {:.1}s", t0.elapsed().as_secs_f64()),
+        }
+    }
 
     // Create channel (bounded to prevent unbounded queue)
     let (command_tx, command_rx) = std_mpsc::sync_channel::<SynthesisRequest>(16);

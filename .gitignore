@@ -1,5 +1,8 @@
 /target/
-Cargo.lock
+
+# Cargo.lock IS tracked: this fork ships a binary (the serve/generate_audio
+# deployment on halo), and the nixcfg package needs the exact dependency
+# graph inside the fetched source to build reproducibly.
 
 # Downloaded test data (not tracked in git)
 /test_data/
