@@ -140,7 +140,16 @@ struct SynthesisRequest {
     format: AudioFormat,
     streaming: bool,
     voice_clone: bool,
+    /// Per-request reference voice. `Some` overrides the startup `--ref-audio`.
+    ref_voice: Option<RefVoice>,
     response_tx: tokio_mpsc::Sender<Result<Vec<u8>, String>>,
+}
+
+/// Decoded reference audio for a single request, plus the cache key it hashes to.
+struct RefVoice {
+    audio: AudioBuffer,
+    text: Option<String>,
+    key: u64,
 }
 
 // ── OpenAI API types ─────────────────────────────────────────────────────
@@ -166,6 +175,12 @@ struct SpeechRequest {
     repetition_penalty: Option<f64>,
     /// Non-standard extension: max frames to generate
     max_frames: Option<usize>,
+    /// Non-standard extension: reference audio for voice cloning, as a base64
+    /// WAV (optionally a `data:audio/wav;base64,...` URI). Base models only.
+    ref_audio: Option<String>,
+    /// Non-standard extension: transcript of `ref_audio`. Supplying it selects
+    /// ICL cloning; omitting it falls back to speaker-embedding-only cloning.
+    ref_text: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -208,6 +223,40 @@ fn resolve_voice(name: &str) -> Result<Speaker, String> {
     mapped
         .parse::<Speaker>()
         .map_err(|_| format!("Unknown voice '{name}'. Available: ryan, serena, vivian, aiden, eric, dylan, uncle_fu, ono_anna, sohee, alloy, nova, echo, fable, onyx, shimmer"))
+}
+
+/// Decode a base64 WAV from a request into reference audio.
+///
+/// Accepts a bare base64 payload or a `data:audio/wav;base64,...` URI, since
+/// clients differ on which they send.
+fn decode_ref_audio(encoded: &str, ref_text: Option<&str>) -> Result<RefVoice, String> {
+    use base64::Engine as _;
+    use std::hash::{Hash, Hasher};
+
+    let payload = match encoded.find("base64,") {
+        Some(idx) if encoded.starts_with("data:") => &encoded[idx + "base64,".len()..],
+        _ => encoded,
+    };
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .map_err(|e| format!("Field 'ref_audio' is not valid base64: {e}"))?;
+
+    let audio = AudioBuffer::from_wav_bytes(&bytes)
+        .map_err(|e| format!("Field 'ref_audio' is not a readable WAV: {e}"))?;
+
+    // Hash the encoded form rather than the samples — same input, same key,
+    // and it avoids walking a few hundred thousand floats per request.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    payload.hash(&mut hasher);
+    ref_text.hash(&mut hasher);
+    let key = hasher.finish();
+
+    Ok(RefVoice {
+        audio,
+        text: ref_text.map(str::to_owned),
+        key,
+    })
 }
 
 // ── App state ────────────────────────────────────────────────────────────
@@ -319,6 +368,18 @@ async fn speech_handler(State(state): State<AppState>, Json(req): Json<SpeechReq
         ..state.default_options.clone()
     };
 
+    // Resolve a per-request reference voice, if the caller sent one
+    let ref_voice = match req.ref_audio.as_deref() {
+        Some(encoded) => match decode_ref_audio(encoded, req.ref_text.as_deref()) {
+            Ok(v) => Some(v),
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
+        },
+        None => None,
+    };
+
+    // Cloning requires either a per-request reference or one pinned at startup
+    let voice_clone = ref_voice.is_some() || state.voice_clone;
+
     // Create response channel
     let (response_tx, mut response_rx) = tokio_mpsc::channel::<Result<Vec<u8>, String>>(32);
 
@@ -329,7 +390,8 @@ async fn speech_handler(State(state): State<AppState>, Json(req): Json<SpeechReq
         options,
         format,
         streaming: state.streaming,
-        voice_clone: state.voice_clone,
+        voice_clone,
+        ref_voice,
         response_tx,
     };
 
@@ -355,13 +417,47 @@ async fn speech_handler(State(state): State<AppState>, Json(req): Json<SpeechReq
 
 // ── Model thread ─────────────────────────────────────────────────────────
 
+/// How many distinct reference voices to keep prompts for.
+///
+/// Building one runs the ECAPA-TDNN speaker encoder (and, for ICL, the speech
+/// encoder) on CPU, which costs far more than a synthesis. Callers overwhelmingly
+/// reuse a handful of voices, so a small cache removes that cost from all but the
+/// first request per voice.
+const PROMPT_CACHE_CAP: usize = 8;
+
 fn run_model_thread(
     model: qwen3_tts::Qwen3TTS<SelectedBackend>,
-    voice_clone_prompt: Option<VoiceClonePrompt<SelectedBackend>>,
+    startup_prompt: Option<VoiceClonePrompt<SelectedBackend>>,
     rx: std_mpsc::Receiver<SynthesisRequest>,
 ) {
+    // Insertion-ordered so eviction can drop the oldest entry.
+    let mut cache: Vec<(u64, VoiceClonePrompt<SelectedBackend>)> = Vec::new();
+
     while let Ok(req) = rx.recv() {
-        let result = process_request(&model, voice_clone_prompt.as_ref(), &req);
+        // Per-request reference voice wins over the one pinned at startup.
+        let prompt = match &req.ref_voice {
+            Some(rv) => {
+                if !cache.iter().any(|(k, _)| *k == rv.key) {
+                    eprintln!("Building voice clone prompt (ICL={})", rv.text.is_some());
+                    match model.create_voice_clone_prompt(&rv.audio, rv.text.as_deref()) {
+                        Ok(p) => {
+                            if cache.len() >= PROMPT_CACHE_CAP {
+                                cache.remove(0);
+                            }
+                            cache.push((rv.key, p));
+                        }
+                        Err(e) => {
+                            let _ = req.response_tx.blocking_send(Err(e.to_string()));
+                            continue;
+                        }
+                    }
+                }
+                cache.iter().find(|(k, _)| *k == rv.key).map(|(_, p)| p)
+            }
+            None => startup_prompt.as_ref(),
+        };
+
+        let result = process_request(&model, prompt, &req);
         if let Err(e) = result {
             let _ = req.response_tx.blocking_send(Err(e));
         }
@@ -379,15 +475,11 @@ fn process_request(
     );
     let t0 = std::time::Instant::now();
     let audio = if req.voice_clone {
-        let prompt = voice_clone_prompt
-            .ok_or("Voice clone prompt not configured")?;
+        let prompt = voice_clone_prompt.ok_or(
+            "Voice cloning requires 'ref_audio' in the request, or --ref-audio at startup",
+        )?;
         model
-            .synthesize_voice_clone(
-                &req.text,
-                prompt,
-                req.language,
-                Some(req.options.clone()),
-            )
+            .synthesize_voice_clone(&req.text, prompt, req.language, Some(req.options.clone()))
             .map_err(|e| e.to_string())?
     } else if req.streaming {
         let mut session = model
@@ -439,10 +531,7 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let default_language: Language = args
-        .language
-        .parse()
-        .expect("Invalid language");
+    let default_language: Language = args.language.parse().expect("Invalid language");
 
     // Load model
     eprintln!("Loading model from {}...", args.model_dir);
@@ -458,10 +547,7 @@ fn main() -> Result<()> {
     let voice_clone_prompt = if let Some(ref ref_audio_path) = args.ref_audio {
         eprintln!("Loading reference audio from {ref_audio_path}...");
         let ref_audio = qwen3_tts::AudioBuffer::load(ref_audio_path)?;
-        let prompt = model.create_voice_clone_prompt(
-            &ref_audio,
-            args.ref_text.as_deref(),
-        )?;
+        let prompt = model.create_voice_clone_prompt(&ref_audio, args.ref_text.as_deref())?;
         eprintln!(
             "Voice clone prompt ready (ICL={})",
             prompt.ref_codes.is_some()

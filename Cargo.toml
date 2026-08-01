@@ -10,7 +10,7 @@ autobenches = false
 default = ["cpu"]
 cpu = ["burn/ndarray", "burn/cpu"]
 cli = ["clap", "indicatif"]
-serve = ["cli", "dep:axum", "dep:tokio", "dep:tokio-stream", "dep:tower-http"]
+serve = ["cli", "dep:axum", "dep:tokio", "dep:tokio-stream", "dep:tower-http", "dep:base64"]
 hub = ["hf-hub"]
 _candle_legacy = []  # Gates old candle-based code during Burn migration
 
@@ -78,6 +78,7 @@ axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 tokio-stream = { version = "0.1", optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
+base64 = { version = "0.22", optional = true }   # ref_audio in speech requests
 
 [dev-dependencies]
 criterion = "0.8"

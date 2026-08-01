@@ -81,6 +81,11 @@ impl AudioBuffer {
         load_wav(path)
     }
 
+    /// Load from a complete WAV file held in memory.
+    pub fn from_wav_bytes(bytes: &[u8]) -> Result<Self> {
+        load_wav_bytes(bytes)
+    }
+
     /// Encode this buffer as a complete WAV file in memory.
     pub fn to_wav_bytes(&self) -> Vec<u8> {
         let spec = WavSpec {
@@ -138,12 +143,8 @@ impl AudioBuffer {
     }
 }
 
-/// Load a WAV file into an AudioBuffer
-pub fn load_wav<P: AsRef<Path>>(path: P) -> Result<AudioBuffer> {
-    let path = path.as_ref();
-    let reader = WavReader::open(path)
-        .with_context(|| format!("Failed to open WAV file: {}", path.display()))?;
-
+/// Decode an open WAV stream into a mono AudioBuffer at its native sample rate.
+fn decode_wav<R: std::io::Read>(reader: WavReader<R>) -> Result<AudioBuffer> {
     let spec = reader.spec();
     let sample_rate = spec.sample_rate;
     let channels = spec.channels as usize;
@@ -173,6 +174,22 @@ pub fn load_wav<P: AsRef<Path>>(path: P) -> Result<AudioBuffer> {
     };
 
     Ok(AudioBuffer::new(mono_samples, sample_rate))
+}
+
+/// Load a WAV file into an AudioBuffer
+pub fn load_wav<P: AsRef<Path>>(path: P) -> Result<AudioBuffer> {
+    let path = path.as_ref();
+    let reader = WavReader::open(path)
+        .with_context(|| format!("Failed to open WAV file: {}", path.display()))?;
+    decode_wav(reader)
+}
+
+/// Decode a complete WAV file held in memory.
+///
+/// Used for reference audio arriving over HTTP, where there is no file on disk.
+pub fn load_wav_bytes(bytes: &[u8]) -> Result<AudioBuffer> {
+    let reader = WavReader::new(std::io::Cursor::new(bytes)).context("Failed to parse WAV data")?;
+    decode_wav(reader)
 }
 
 /// Save samples to a WAV file
@@ -210,6 +227,26 @@ mod tests {
         let buffer = AudioBuffer::new(samples.clone(), 16000);
         assert_eq!(buffer.samples, samples);
         assert_eq!(buffer.sample_rate, 16000);
+    }
+
+    #[test]
+    fn test_from_wav_bytes_roundtrip() {
+        let samples: Vec<f32> = (0..480).map(|i| (i as f32 / 480.0) * 2.0 - 1.0).collect();
+        let original = AudioBuffer::new(samples, 24000);
+
+        let decoded = AudioBuffer::from_wav_bytes(&original.to_wav_bytes()).unwrap();
+
+        assert_eq!(decoded.sample_rate, original.sample_rate);
+        assert_eq!(decoded.len(), original.len());
+        // 16-bit quantization is the only loss in the roundtrip
+        for (a, b) in original.samples.iter().zip(&decoded.samples) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn test_from_wav_bytes_rejects_garbage() {
+        assert!(AudioBuffer::from_wav_bytes(b"definitely not a wav file").is_err());
     }
 
     #[test]
