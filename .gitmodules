@@ -1,0 +1,16 @@
+[submodule "cubecl"]
+	path = cubecl
+	url = https://github.com/haraldh/cubecl.git
+	branch = qwen3-tts-rs
+[submodule "cubek"]
+	path = cubek
+	url = https://github.com/haraldh/cubek.git
+	branch = qwen3-tts-rs
+[submodule "burn"]
+	path = burn
+	url = https://github.com/haraldh/burn.git
+	branch = qwen3-tts-rs
+[submodule "cubecl-hip-sys"]
+	path = cubecl-hip-sys
+	url = https://github.com/haraldh/cubecl-hip-sys.git
+	branch = qwen3-tts-rs
