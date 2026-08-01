@@ -6,8 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build                                    # CPU debug
-cargo build --release --features rocm,cli      # ROCm release with CLI
-cargo build --release --features cuda,cli      # CUDA release with CLI
+cargo build --release --features rocm,serve    # ROCm release with CLI + HTTP server
+cargo build --release --features cuda,serve    # CUDA release with CLI + HTTP server
+cargo build --release --features rocm,cli      # ROCm release with CLI only (no server)
+cargo build --release --features cuda,cli      # CUDA release with CLI only (no server)
 cargo test --lib                               # Unit tests (no model weights needed)
 cargo test --test integration                  # Integration tests (no weights)
 cargo test --lib -- generation::sampling       # Single test module
