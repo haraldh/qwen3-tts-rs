@@ -1,30 +1,31 @@
 #!/usr/bin/env python3
-"""Verify TTS audio quality by transcribing via Wyoming STT and comparing to input text.
+"""Verify TTS audio quality by transcribing via whisper.cpp STT and comparing to input text.
+
+Talks to whisper.cpp's OpenAI-compatible server (`/v1/audio/transcriptions`), which
+runs on halo:8771 backed by large-v3 on the Strix Halo iGPU. Standard library only —
+no openai, requests, or whisper package needed.
 
 Usage:
-    python3 scripts/verify_audio.py /tmp/test.wav "Hello, this is a test of the text to speech system."
-    python3 scripts/verify_audio.py --host localhost --port 10300 /tmp/test.wav "expected text"
+    python3 scripts/verify_audio.py /var/tmp/test.wav "Hello, this is a test of the text to speech system."
+    python3 scripts/verify_audio.py --url http://localhost:8771/v1/audio/transcriptions out.wav "expected text"
+
+Override the default endpoint with the WHISPER_URL environment variable.
 
 Exit code 0 if transcription is sufficiently similar, 1 otherwise.
 """
 
 import argparse
+import io
 import json
-import socket
+import os
+import re
 import sys
+import urllib.error
+import urllib.request
+import uuid
 import wave
 
-
-def clip_wav(path: str, max_seconds: float) -> bytes:
-    """Read a WAV file clipped to max_seconds. Returns (frames, rate, width, channels)."""
-    with wave.open(path, "rb") as w:
-        rate = w.getframerate()
-        width = w.getsampwidth()
-        channels = w.getnchannels()
-        max_frames = int(max_seconds * rate)
-        n = min(w.getnframes(), max_frames)
-        frames = w.readframes(n)
-    return frames, rate, width, channels
+DEFAULT_URL = os.environ.get("WHISPER_URL", "http://halo:8771/v1/audio/transcriptions")
 
 
 def estimate_duration(text: str, chars_per_second: float = 14.0, margin: float = 1.5) -> float:
@@ -36,84 +37,71 @@ def estimate_duration(text: str, chars_per_second: float = 14.0, margin: float =
     return max(5.0, len(text) / chars_per_second * margin)
 
 
-def transcribe_wav(
-    path: str, host: str = "localhost", port: int = 10300, max_seconds: float = 0
-) -> str:
-    frames, rate, width, channels = (
-        clip_wav(path, max_seconds) if max_seconds > 0 else _read_wav(path)
-    )
+def read_wav_clipped(path: str, max_seconds: float) -> bytes:
+    """Return the WAV file as bytes, clipped to max_seconds.
 
-    timeout = max(30, int(len(frames) / rate / width * 0.5) + 30)
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((host, port))
-    sock.settimeout(timeout)
-
-    def send_event(etype, data=None, payload=b""):
-        data_bytes = json.dumps(data).encode() if data else b""
-        evt = {
-            "type": etype,
-            "data_length": len(data_bytes),
-            "payload_length": len(payload),
-        }
-        sock.sendall(json.dumps(evt).encode() + b"\n")
-        if data_bytes:
-            sock.sendall(data_bytes)
-        if payload:
-            sock.sendall(payload)
-
-    def recv_events():
-        buf = b""
-        while True:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                evt = json.loads(line)
-                data_len = evt.get("data_length", 0)
-                payload_len = evt.get("payload_length", 0)
-                total = data_len + payload_len
-                while len(buf) < total:
-                    buf += sock.recv(4096)
-                data = json.loads(buf[:data_len]) if data_len else None
-                buf = buf[total:]
-                yield evt["type"], data
-
-    send_event("transcribe", {"language": "en"})
-    send_event("audio-start", {"rate": rate, "width": width, "channels": channels})
-    chunk_size = 16000
-    for i in range(0, len(frames), chunk_size):
-        send_event("audio-chunk", payload=frames[i : i + chunk_size])
-    send_event("audio-stop")
-
-    for etype, data in recv_events():
-        if etype == "transcript":
-            sock.close()
-            return data.get("text", "")
-        elif etype == "error":
-            sock.close()
-            raise RuntimeError(f"STT error: {data}")
-
-    sock.close()
-    raise RuntimeError("No transcript received")
-
-
-def _read_wav(path: str):
-    """Read full WAV file."""
+    Clipping guards against degenerate generations that loop for minutes — the
+    transcription only needs to cover the expected text.
+    """
     with wave.open(path, "rb") as w:
         rate = w.getframerate()
         width = w.getsampwidth()
         channels = w.getnchannels()
-        frames = w.readframes(w.getnframes())
-    return frames, rate, width, channels
+        total = w.getnframes()
+        n = min(total, int(max_seconds * rate)) if max_seconds > 0 else total
+        frames = w.readframes(n)
+
+    if n == total:
+        with open(path, "rb") as f:
+            return f.read()
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as out:
+        out.setnchannels(channels)
+        out.setsampwidth(width)
+        out.setframerate(rate)
+        out.writeframes(frames)
+    return buf.getvalue()
+
+
+def transcribe(wav_bytes: str, url: str, language: str, timeout: float) -> str:
+    """POST the audio as multipart/form-data and return the transcript text."""
+    boundary = uuid.uuid4().hex
+    fields = {"language": language, "response_format": "json"}
+
+    parts = []
+    for name, value in fields.items():
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+        )
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+        f"Content-Type: audio/wav\r\n\r\n".encode()
+    )
+    parts.append(wav_bytes)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"STT request to {url} failed: {e}") from e
+
+    text = payload.get("text")
+    if text is None:
+        raise RuntimeError(f"No 'text' field in STT response: {payload}")
+    return text.strip()
 
 
 def normalize(text: str) -> str:
     """Normalize text for comparison: lowercase, strip punctuation, collapse whitespace."""
-    import re
-
     text = text.lower()
     text = re.sub(r"[^\w\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -133,8 +121,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("wav", help="Path to WAV file to transcribe")
     parser.add_argument("expected", help="Expected text content")
-    parser.add_argument("--host", default="localhost")
-    parser.add_argument("--port", type=int, default=10300)
+    parser.add_argument("--url", default=DEFAULT_URL, help=f"STT endpoint (default: {DEFAULT_URL})")
+    parser.add_argument("--language", default="en", help="Language hint for STT (default: en)")
+    parser.add_argument("--timeout", type=float, default=120.0, help="Request timeout in seconds")
     parser.add_argument(
         "--threshold",
         type=float,
@@ -143,9 +132,9 @@ def main():
     )
     args = parser.parse_args()
 
-    # Clip audio to expected duration to avoid STT timeouts on long/degenerate outputs
-    max_seconds = estimate_duration(args.expected)
-    transcript = transcribe_wav(args.wav, args.host, args.port, max_seconds=max_seconds)
+    # Clip audio to expected duration so degenerate output can't stall transcription
+    wav_bytes = read_wav_clipped(args.wav, estimate_duration(args.expected))
+    transcript = transcribe(wav_bytes, args.url, args.language, args.timeout)
     overlap = word_overlap(args.expected, transcript)
 
     print(f"Expected:    {args.expected}")
