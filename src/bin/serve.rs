@@ -9,6 +9,7 @@
 
 use anyhow::Result;
 use axum::{
+    body::Body,
     extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -19,6 +20,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc as std_mpsc;
 use tokio::sync::mpsc as tokio_mpsc;
+use tokio_stream::{wrappers::ReceiverStream, StreamExt as _};
 
 use qwen3_tts::{AudioBuffer, Language, Speaker, SynthesisOptions, VoiceClonePrompt};
 
@@ -421,12 +423,28 @@ async fn speech_handler(State(state): State<AppState>, Json(req): Json<SpeechReq
         );
     }
 
-    // Wait for complete response (synthesis decodes all codes at once to avoid gaps)
+    // Await the first chunk before replying. Once the status line is on the
+    // wire it cannot be taken back, so a synthesis that fails immediately still
+    // gets a proper error code; anything after that streams.
     match response_rx.recv().await {
-        Some(Ok(bytes)) => {
+        Some(Ok(first)) => {
             let mut headers = HeaderMap::new();
             headers.insert("content-type", content_type.parse().unwrap());
-            (StatusCode::OK, headers, bytes).into_response()
+
+            // Non-streaming synthesis sends exactly one buffer, so this same
+            // path serves both: the stream simply ends after the first item.
+            let rest = ReceiverStream::new(response_rx).map(|res| match res {
+                Ok(bytes) => Ok(bytes),
+                // A mid-stream failure can only be signalled by breaking the
+                // body — the client sees a truncated response.
+                Err(e) => {
+                    eprintln!("Synthesis failed mid-stream: {e}");
+                    Err(std::io::Error::other(e))
+                }
+            });
+            let body =
+                Body::from_stream(tokio_stream::once(Ok::<_, std::io::Error>(first)).chain(rest));
+            (StatusCode::OK, headers, body).into_response()
         }
         Some(Err(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
         None => error_response(StatusCode::INTERNAL_SERVER_ERROR, "Model thread dropped"),
@@ -492,6 +510,58 @@ fn process_request(
         req.voice_clone, req.language, req.streaming, &req.text
     );
     let t0 = std::time::Instant::now();
+
+    // Stream only for PCM. A WAV header declares the data length up front, so
+    // it cannot be written before generation finishes; PCM is headerless and
+    // can go out frame by frame. Clients asking for wav still get one buffer.
+    if req.streaming && matches!(req.format, AudioFormat::Pcm) {
+        let mut session = if req.voice_clone {
+            let prompt = voice_clone_prompt.ok_or(
+                "Voice cloning requires 'ref_audio' in the request, or --ref-audio at startup",
+            )?;
+            model
+                .synthesize_voice_clone_streaming(
+                    &req.text,
+                    prompt,
+                    req.language,
+                    req.options.clone(),
+                )
+                .map_err(|e| e.to_string())?
+        } else {
+            model
+                .synthesize_streaming(&req.text, req.speaker, req.language, req.options.clone())
+                .map_err(|e| e.to_string())?
+        };
+
+        let mut total_samples = 0usize;
+        let mut ttfa = None;
+        while let Some(chunk) = session.next_chunk().map_err(|e| e.to_string())? {
+            total_samples += chunk.samples.len();
+            ttfa.get_or_insert_with(|| t0.elapsed());
+            // A send error means the client hung up; stop generating rather
+            // than finish an answer nobody is listening to.
+            if req
+                .response_tx
+                .blocking_send(Ok(chunk.to_pcm_i16_bytes()))
+                .is_err()
+            {
+                eprintln!("Client disconnected mid-stream, aborting synthesis");
+                return Ok(());
+            }
+        }
+
+        let elapsed = t0.elapsed();
+        let duration = total_samples as f64 / 24000.0;
+        eprintln!(
+            "Streamed {:.2}s audio in {:.2}s (RTF={:.2}x, first chunk after {:.2}s)",
+            duration,
+            elapsed.as_secs_f64(),
+            elapsed.as_secs_f64() / duration,
+            ttfa.unwrap_or_default().as_secs_f64(),
+        );
+        return Ok(());
+    }
+
     let audio = if req.voice_clone {
         let prompt = voice_clone_prompt.ok_or(
             "Voice cloning requires 'ref_audio' in the request, or --ref-audio at startup",
@@ -499,15 +569,6 @@ fn process_request(
         model
             .synthesize_voice_clone(&req.text, prompt, req.language, Some(req.options.clone()))
             .map_err(|e| e.to_string())?
-    } else if req.streaming {
-        let mut session = model
-            .synthesize_streaming(&req.text, req.speaker, req.language, req.options.clone())
-            .map_err(|e| e.to_string())?;
-        let mut all_samples = Vec::new();
-        while let Some(chunk) = session.next_chunk().map_err(|e| e.to_string())? {
-            all_samples.extend_from_slice(&chunk.samples);
-        }
-        AudioBuffer::new(all_samples, 24000)
     } else {
         model
             .synthesize_with_voice(
