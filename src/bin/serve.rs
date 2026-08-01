@@ -88,7 +88,7 @@ struct Args {
     #[arg(long, default_value_t = 2048)]
     max_frames: usize,
 
-    /// Use streaming synthesis (per-chunk decode; may have boundary artifacts)
+    /// Send audio chunk by chunk as it is decoded, rather than in one response
     #[arg(long)]
     streaming: bool,
 
@@ -511,10 +511,7 @@ fn process_request(
     );
     let t0 = std::time::Instant::now();
 
-    // Stream only for PCM. A WAV header declares the data length up front, so
-    // it cannot be written before generation finishes; PCM is headerless and
-    // can go out frame by frame. Clients asking for wav still get one buffer.
-    if req.streaming && matches!(req.format, AudioFormat::Pcm) {
+    if req.streaming {
         let mut session = if req.voice_clone {
             let prompt = voice_clone_prompt.ok_or(
                 "Voice cloning requires 'ref_audio' in the request, or --ref-audio at startup",
@@ -535,16 +532,21 @@ fn process_request(
 
         let mut total_samples = 0usize;
         let mut ttfa = None;
+        // WAV streams get a header whose length fields say "unknown", so the
+        // format costs one 44-byte message up front rather than the wait for a
+        // complete file. PCM is headerless and needs nothing.
+        let mut pending_header = match req.format {
+            AudioFormat::Wav => Some(AudioBuffer::wav_stream_header(24000)),
+            AudioFormat::Pcm => None,
+        };
         while let Some(chunk) = session.next_chunk().map_err(|e| e.to_string())? {
             total_samples += chunk.samples.len();
             ttfa.get_or_insert_with(|| t0.elapsed());
+            let mut bytes = pending_header.take().unwrap_or_default();
+            bytes.extend_from_slice(&chunk.to_pcm_i16_bytes());
             // A send error means the client hung up; stop generating rather
             // than finish an answer nobody is listening to.
-            if req
-                .response_tx
-                .blocking_send(Ok(chunk.to_pcm_i16_bytes()))
-                .is_err()
-            {
+            if req.response_tx.blocking_send(Ok(bytes)).is_err() {
                 eprintln!("Client disconnected mid-stream, aborting synthesis");
                 return Ok(());
             }

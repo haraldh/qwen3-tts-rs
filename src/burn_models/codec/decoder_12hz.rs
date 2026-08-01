@@ -873,6 +873,96 @@ mod tests {
         assert_eq!(output.dims(), [2, 64, 100]);
     }
 
+    /// A shrunk decoder — same topology, small channel counts — so the shape
+    /// and causality invariants can be checked without model weights.
+    fn tiny_decoder(device: &<B as Backend>::Device) -> Decoder12Hz<B> {
+        Decoder12Hz::init(
+            Decoder12HzConfig {
+                codebook_size: 32,
+                codebook_dim: 16,
+                latent_dim: 16,
+                hidden_size: 16,
+                num_heads: 2,
+                head_dim: 8,
+                intermediate_size: 32,
+                num_layers: 2,
+                decoder_dim: 16,
+                ..Default::default()
+            },
+            device,
+        )
+    }
+
+    fn tiny_codes(num_frames: usize) -> Vec<Vec<u32>> {
+        (0..num_frames)
+            .map(|f| (0..16).map(|q| ((f * 7 + q * 3) % 32) as u32).collect())
+            .collect()
+    }
+
+    fn decode_frames(
+        dec: &Decoder12Hz<B>,
+        codes: &[Vec<u32>],
+        device: &<B as Backend>::Device,
+    ) -> Vec<f32> {
+        let num_frames = codes.len();
+        let mut data = vec![0i32; 16 * num_frames];
+        for (frame, frame_codes) in codes.iter().enumerate() {
+            for (q, &code) in frame_codes.iter().enumerate() {
+                data[q * num_frames + frame] = code as i32;
+            }
+        }
+        let tensor =
+            Tensor::<B, 1, Int>::from_ints(data.as_slice(), device).reshape([1, 16, num_frames]);
+        let out = dec.decode(tensor);
+        let samples = out.dims()[2];
+        out.reshape([samples])
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap()
+    }
+
+    /// The decoder emits exactly `total_upsample` samples per frame.
+    ///
+    /// The streaming path slices chunks out of a decode at frame boundaries, so
+    /// it relies on that ratio being exact rather than approximate.
+    #[test]
+    fn test_decode_length_is_exact_multiple_of_frames() {
+        let device = Default::default();
+        let dec = tiny_decoder(&device);
+        for frames in [2, 3, 5] {
+            let samples = decode_frames(&dec, &tiny_codes(frames), &device);
+            assert_eq!(samples.len(), frames * dec.total_upsample());
+        }
+    }
+
+    /// Decoding a prefix of a sequence reproduces the prefix of the decode.
+    ///
+    /// This is what makes the streaming overlap-and-discard in
+    /// `StreamingSession` sound: because every convolution pads on the left only
+    /// and the transformer is causally masked, a frame's audio depends on the
+    /// frames before it and on nothing after. Replaying preceding frames as
+    /// context therefore recovers what a whole-utterance decode would have
+    /// produced. If this ever fails, chunked decoding cannot be made exact.
+    #[test]
+    fn test_decode_is_causal_in_frames() {
+        let device = Default::default();
+        let dec = tiny_decoder(&device);
+        let codes = tiny_codes(8);
+
+        let full = decode_frames(&dec, &codes, &device);
+        let prefix = decode_frames(&dec, &codes[..5], &device);
+
+        let overlap = prefix.len();
+        assert_eq!(overlap, 5 * dec.total_upsample());
+        for (i, (&a, &b)) in prefix.iter().zip(full.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "sample {i} diverges: prefix decode {a}, full decode {b}"
+            );
+        }
+    }
+
     #[test]
     fn test_causal_transconv_shape() {
         let device = Default::default();

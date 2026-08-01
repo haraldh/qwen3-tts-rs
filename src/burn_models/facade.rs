@@ -35,8 +35,27 @@ fn set_penalty_bit<B: Backend>(
     mask.clone().slice_assign([idx..idx + 1], true_val)
 }
 
-/// Number of audio samples per codec frame at 24kHz (1920 = 80ms at 12Hz).
+/// Number of audio samples per codec frame at 24kHz (1920 = 80ms at 12.5Hz).
 pub const SAMPLES_PER_FRAME: usize = 1920;
+
+/// Trailing silence appended to a finished utterance (50ms at 24kHz), which
+/// keeps an early EOS from clipping the last syllable.
+const TAIL_PAD_SAMPLES: usize = 24000 / 20;
+
+/// Frames of already-emitted audio replayed through the decoder as left context
+/// for each streaming chunk.
+///
+/// The decoder is causal but not stateless: an 8-layer transformer runs over the
+/// code sequence before the conv stack, so a chunk decoded on its own starts
+/// from nothing and the reconstruction drifts — audibly, as scrambled speech on
+/// longer utterances. Replaying the preceding frames restores that context at
+/// the cost of decoding them again, so this trades decode throughput for
+/// fidelity: cost per chunk scales as `(DECODE_CONTEXT_FRAMES + chunk_frames) /
+/// chunk_frames`.
+///
+/// 64 frames is a shade under the decoder's own `sliding_window` of 72, past
+/// which the reference implementation stops attending anyway.
+const DECODE_CONTEXT_FRAMES: usize = 64;
 
 /// Minimum repetition penalty for ICL mode (matches mlx-audio).
 const ICL_MIN_REPETITION_PENALTY: f64 = 1.2;
@@ -756,6 +775,21 @@ impl<B: Backend> Qwen3TTS<B> {
         if codes.is_empty() {
             return Ok(AudioBuffer::new(Vec::new(), 24000));
         }
+        let mut samples = self.decode_samples(codes)?;
+        samples.extend(std::iter::repeat_n(0.0f32, TAIL_PAD_SAMPLES));
+        Ok(AudioBuffer::new(samples, 24000))
+    }
+
+    /// Decode `codes` to raw samples, with no trailing silence appended.
+    ///
+    /// `samples[0]` is the first sample of `codes[0]`, so a decode that starts
+    /// part-way into an utterance can be placed by multiplying its first frame
+    /// index by [`SAMPLES_PER_FRAME`]. The result may be shorter than
+    /// `codes.len() * SAMPLES_PER_FRAME` — see [`StreamingSession::emit_chunk`].
+    fn decode_samples(&self, codes: &[Vec<u32>]) -> anyhow::Result<Vec<f32>> {
+        if codes.is_empty() {
+            return Ok(Vec::new());
+        }
 
         #[cfg(feature = "profiling")]
         let _decode_span = tracing::info_span!("decode").entered();
@@ -764,41 +798,32 @@ impl<B: Backend> Qwen3TTS<B> {
         // for very short sequences (in_len=1 with stride=2 gives out_len=2 instead
         // of 4), causing CausalTransConv1d trimming to underflow.  Pad to 2 frames
         // minimum and trim the extra audio afterward.
-        let (tensor, original_frames) = if codes.len() < 2 {
-            let mut padded = codes.to_vec();
-            while padded.len() < 2 {
-                padded.push(padded.last().unwrap().clone());
+        let padded_codes;
+        let (decoded_codes, padded) = if codes.len() < 2 {
+            let mut p = codes.to_vec();
+            while p.len() < 2 {
+                p.push(p.last().unwrap().clone());
             }
-            let t = self.codes_to_tensor(&padded);
-            (t, codes.len())
+            padded_codes = p;
+            (&padded_codes[..], true)
         } else {
-            let t = self.codes_to_tensor(codes);
-            let n = codes.len();
-            (t, n)
+            (codes, false)
         };
 
-        let total_frames = if codes.len() < 2 { 2 } else { codes.len() };
-        let waveform = self.decoder.decode(tensor); // [1, 1, samples]
+        let waveform = self.decoder.decode(self.codes_to_tensor(decoded_codes)); // [1, 1, samples]
         let total_samples = waveform.dims()[2];
-
-        // If we padded, keep only the proportion from original frames
-        let num_samples = if original_frames < total_frames {
-            total_samples * original_frames / total_frames
-        } else {
-            total_samples
-        };
-
-        let samples: Vec<f32> = waveform
+        let mut samples: Vec<f32> = waveform
             .reshape([total_samples])
             .into_data()
             .convert::<f32>()
             .to_vec()
             .unwrap();
-        // Pad 50ms silence to prevent last-syllable clipping from early EOS
-        let pad_samples = 24000 / 20; // 50ms at 24kHz = 1200 samples
-        let mut padded = samples[..num_samples].to_vec();
-        padded.extend(std::iter::repeat(0.0f32).take(pad_samples));
-        Ok(AudioBuffer::new(padded, 24000))
+
+        if padded {
+            let keep = total_samples * codes.len() / decoded_codes.len();
+            samples.truncate(keep);
+        }
+        Ok(samples)
     }
 
     // ── Private helpers ──────────────────────────────────────────────────
@@ -1215,6 +1240,12 @@ pub struct StreamingSession<'a, B: Backend> {
     current_token: Option<u32>,
     frames_generated: usize,
     frame_buffer: FrameCodes,
+    /// Tail of the frames already decoded, replayed as decoder left context.
+    decode_context: FrameCodes,
+    /// Utterance-wide frame index of `decode_context[0]`.
+    context_start_frame: usize,
+    /// Utterance-wide count of samples already handed to the caller.
+    emitted_samples: usize,
     chunk_frames: usize,
     done: bool,
     trailing_text_hidden: Tensor<B, 3>,
@@ -1446,6 +1477,9 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
             current_token: if done { None } else { Some(first_token) },
             frames_generated: 0,
             frame_buffer: Vec::new(),
+            decode_context: Vec::new(),
+            context_start_frame: 0,
+            emitted_samples: 0,
             chunk_frames: options.chunk_frames,
             done,
             trailing_text_hidden,
@@ -1542,6 +1576,9 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
             current_token: if done { None } else { Some(first_token) },
             frames_generated: 0,
             frame_buffer: Vec::new(),
+            decode_context: Vec::new(),
+            context_start_frame: 0,
+            emitted_samples: 0,
             chunk_frames,
             done,
             trailing_text_hidden,
@@ -1564,12 +1601,7 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
     pub fn next_chunk(&mut self) -> anyhow::Result<Option<AudioBuffer>> {
         if self.done {
             // Flush remaining buffer
-            if !self.frame_buffer.is_empty() {
-                let audio = self.model.decode_codes(&self.frame_buffer)?;
-                self.frame_buffer.clear();
-                return Ok(Some(audio));
-            }
-            return Ok(None);
+            return self.emit_chunk();
         }
 
         // Generate frames until we have enough for a chunk
@@ -1697,14 +1729,51 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
             }
         }
 
-        // Decode buffered frames
+        self.emit_chunk()
+    }
+
+    /// Decode and hand out the buffered frames, carrying decoder context across
+    /// the chunk boundary.
+    ///
+    /// The buffered frames are decoded with up to [`DECODE_CONTEXT_FRAMES`] of
+    /// already decoded frames prepended, and only the samples past what has
+    /// already been emitted are returned — without that context each chunk would
+    /// restart the decoder's transformer from nothing. The trailing silence goes
+    /// on the last chunk only, so it does not punch a gap into the middle of the
+    /// utterance.
+    ///
+    /// Positions are tracked in absolute samples rather than by counting context
+    /// frames, because a decode does not always yield `frames * SAMPLES_PER_FRAME`
+    /// samples: ROCm's ConvTranspose1d comes up a fixed number short, and the
+    /// shortfall is at the tail (measured: 2880 samples, independent of length).
+    /// Each chunk's decode reaches further into the utterance than the last, so
+    /// resuming from the absolute cursor picks those samples up on the next
+    /// round instead of leaving a gap at every boundary.
+    fn emit_chunk(&mut self) -> anyhow::Result<Option<AudioBuffer>> {
         if self.frame_buffer.is_empty() {
             return Ok(None);
         }
 
-        let audio = self.model.decode_codes(&self.frame_buffer)?;
-        self.frame_buffer.clear();
-        Ok(Some(audio))
+        let mut codes = std::mem::take(&mut self.decode_context);
+        codes.append(&mut self.frame_buffer);
+
+        let decoded = self.model.decode_samples(&codes)?;
+        // Where this decode starts and ends within the utterance.
+        let base = self.context_start_frame * SAMPLES_PER_FRAME;
+        let skip = self.emitted_samples.saturating_sub(base).min(decoded.len());
+        self.emitted_samples = base + decoded.len();
+
+        let mut samples = decoded[skip..].to_vec();
+        if self.done {
+            samples.extend(std::iter::repeat_n(0.0f32, TAIL_PAD_SAMPLES));
+        }
+
+        let dropped = codes.len().saturating_sub(DECODE_CONTEXT_FRAMES);
+        codes.drain(..dropped);
+        self.context_start_frame += dropped;
+        self.decode_context = codes;
+
+        Ok(Some(AudioBuffer::new(samples, 24000)))
     }
 
     /// Returns the total number of frames generated so far.

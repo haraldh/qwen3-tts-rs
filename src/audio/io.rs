@@ -107,6 +107,38 @@ impl AudioBuffer {
         cursor.into_inner()
     }
 
+    /// A 44-byte WAV header for a stream whose length is not yet known.
+    ///
+    /// The RIFF and data chunk sizes are written as `0xFFFFFFFF` rather than a
+    /// real byte count, which is what ffmpeg emits to a pipe and what players
+    /// take as "read until the stream ends". It lets a `response_format=wav`
+    /// request start playing on the first chunk instead of waiting for the whole
+    /// utterance; the trade is that the header is a lie a seeking player cannot
+    /// use, so anything that needs an accurate duration must ask for a buffered
+    /// response instead.
+    pub fn wav_stream_header(sample_rate: u32) -> Vec<u8> {
+        const UNKNOWN: u32 = u32::MAX;
+        let channels: u16 = 1;
+        let bits: u16 = 16;
+        let block_align = channels * bits / 8;
+        let byte_rate = sample_rate * u32::from(block_align);
+
+        let mut h = Vec::with_capacity(44);
+        h.extend_from_slice(b"RIFF");
+        h.extend_from_slice(&UNKNOWN.to_le_bytes());
+        h.extend_from_slice(b"WAVEfmt ");
+        h.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+        h.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        h.extend_from_slice(&channels.to_le_bytes());
+        h.extend_from_slice(&sample_rate.to_le_bytes());
+        h.extend_from_slice(&byte_rate.to_le_bytes());
+        h.extend_from_slice(&block_align.to_le_bytes());
+        h.extend_from_slice(&bits.to_le_bytes());
+        h.extend_from_slice(b"data");
+        h.extend_from_slice(&UNKNOWN.to_le_bytes());
+        h
+    }
+
     /// Encode samples as raw PCM i16 little-endian bytes (no header).
     pub fn to_pcm_i16_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(self.samples.len() * 2);
