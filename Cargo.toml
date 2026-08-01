@@ -30,8 +30,16 @@ vulkan = ["wgpu", "burn/vulkan"]
 profiling = ["dep:tracing-chrome"]
 
 [dependencies]
-# Burn ML framework (replaces Candle)
-burn = { path = "burn/crates/burn", default-features = false }
+# Burn ML framework (replaces Candle).
+#
+# `ndarray` is unconditional, not part of the `cpu` feature: the speaker
+# encoder always runs on NdArray regardless of the compute backend (see
+# weight_loader.rs), so a GPU-only build still needs it. Note this is NOT
+# `burn/cpu` — that is the LLVM JIT backend, whose cubecl-cpu build script
+# downloads ~600 MB of LLVM into $HOME, which no sandboxed build can do.
+burn = { path = "burn/crates/burn", default-features = false, features = [
+  "ndarray",
+] }
 half = "2.7"
 safetensors = "0.4"
 
