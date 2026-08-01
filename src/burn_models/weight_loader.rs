@@ -1198,14 +1198,24 @@ fn load_speaker_encoder<B: Backend>(
     let mut encoder = SpeakerEncoder::<B>::init(config, device);
 
     // Initial TDNN (blocks.0)
-    load_conv1d_weights(&mut encoder.initial_tdnn.conv.conv, &se, "blocks.0.conv.", device)?;
+    load_conv1d_weights(
+        &mut encoder.initial_tdnn.conv.conv,
+        &se,
+        "blocks.0.conv.",
+        device,
+    )?;
 
     // SE-Res2Net blocks (blocks.1, blocks.2, blocks.3 in safetensors → index 0,1,2)
     for i in 0..3 {
         let block = &mut encoder.se_res2net_blocks[i];
         let p = format!("blocks.{}.", i + 1);
 
-        load_conv1d_weights(&mut block.tdnn1.conv.conv, &se, &format!("{p}tdnn1.conv."), device)?;
+        load_conv1d_weights(
+            &mut block.tdnn1.conv.conv,
+            &se,
+            &format!("{p}tdnn1.conv."),
+            device,
+        )?;
 
         for k in 0..block.res2net_block.blocks.len() {
             load_conv1d_weights(
@@ -1216,18 +1226,38 @@ fn load_speaker_encoder<B: Backend>(
             )?;
         }
 
-        load_conv1d_weights(&mut block.tdnn2.conv.conv, &se, &format!("{p}tdnn2.conv."), device)?;
+        load_conv1d_weights(
+            &mut block.tdnn2.conv.conv,
+            &se,
+            &format!("{p}tdnn2.conv."),
+            device,
+        )?;
 
         // SE block conv1/conv2 are direct Conv1d (not wrapped in ReflectPadConv1d)
-        load_conv1d_weights(&mut block.se_block.conv1, &se, &format!("{p}se_block.conv1."), device)?;
-        load_conv1d_weights(&mut block.se_block.conv2, &se, &format!("{p}se_block.conv2."), device)?;
+        load_conv1d_weights(
+            &mut block.se_block.conv1,
+            &se,
+            &format!("{p}se_block.conv1."),
+            device,
+        )?;
+        load_conv1d_weights(
+            &mut block.se_block.conv2,
+            &se,
+            &format!("{p}se_block.conv2."),
+            device,
+        )?;
     }
 
     // MFA TDNN
     load_conv1d_weights(&mut encoder.mfa_tdnn.conv.conv, &se, "mfa.conv.", device)?;
 
     // ASP (attentive statistics pooling)
-    load_conv1d_weights(&mut encoder.asp.tdnn.conv.conv, &se, "asp.tdnn.conv.", device)?;
+    load_conv1d_weights(
+        &mut encoder.asp.tdnn.conv.conv,
+        &se,
+        "asp.tdnn.conv.",
+        device,
+    )?;
     load_conv1d_weights(&mut encoder.asp.conv, &se, "asp.conv.", device)?;
 
     // Final FC projection
@@ -1309,7 +1339,10 @@ pub fn load_all<B: Backend>(model_dir: &Path, device: &B::Device) -> Result<Load
     };
 
     if has_int4 {
-        tracing::info!("Int4 quantized weights available at {}", int4_path.display());
+        tracing::info!(
+            "Int4 quantized weights available at {}",
+            int4_path.display()
+        );
     }
 
     Ok(LoadedComponents {
@@ -1362,8 +1395,8 @@ pub struct Int4SafeTensors {
 impl Int4SafeTensors {
     /// Load an int4 safetensors file.
     pub fn load(path: &Path) -> Result<Self> {
-        let data = std::fs::read(path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let data =
+            std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
         let header_size = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
         let header: HashMap<String, serde_json::Value> =
             serde_json::from_slice(&data[8..8 + header_size])
@@ -1373,9 +1406,12 @@ impl Int4SafeTensors {
 
     /// Get raw bytes for a tensor key.
     pub fn raw_bytes(&self, key: &str) -> Result<&[u8]> {
-        let info = self.header.get(key)
+        let info = self
+            .header
+            .get(key)
             .with_context(|| format!("Key not found in int4 safetensors: {key}"))?;
-        let offsets = info["data_offsets"].as_array()
+        let offsets = info["data_offsets"]
+            .as_array()
             .context("Missing data_offsets")?;
         let start = offsets[0].as_u64().unwrap() as usize;
         let end = offsets[1].as_u64().unwrap() as usize;

@@ -322,12 +322,11 @@ impl HipTalker {
                 let scales_key = format!("{prefix}.{suffix}_scales");
                 let zeros_key = format!("{prefix}.{suffix}_zeros");
                 if int4_file.has_key(&int4_key) {
-                    let packed_bytes =
-                        int4_file.raw_bytes(&int4_key).map_err(|e| e.to_string())?;
-                    let scale_bytes =
-                        int4_file.raw_bytes(&scales_key).map_err(|e| e.to_string())?;
-                    let zeros_bytes =
-                        int4_file.raw_bytes(&zeros_key).map_err(|e| e.to_string())?;
+                    let packed_bytes = int4_file.raw_bytes(&int4_key).map_err(|e| e.to_string())?;
+                    let scale_bytes = int4_file
+                        .raw_bytes(&scales_key)
+                        .map_err(|e| e.to_string())?;
+                    let zeros_bytes = int4_file.raw_bytes(&zeros_key).map_err(|e| e.to_string())?;
                     // Free old BF16 buffer
                     if let WeightPtr::Bf16(old) = *weight_ptr {
                         unsafe { cubecl_hip_sys::hipFree(old) };
@@ -525,7 +524,11 @@ impl HipTalker {
                 ];
                 self.launch_kernel(self.kernels.gemv, n as u32, 1, 1, 256, 1, 1, 0, &mut args);
             }
-            WeightPtr::Int4 { packed, scales, zeros } => {
+            WeightPtr::Int4 {
+                packed,
+                scales,
+                zeros,
+            } => {
                 let mut p_input = input;
                 let mut p_packed = packed;
                 let mut p_output = output;

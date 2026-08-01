@@ -208,7 +208,11 @@ impl HipFrameLoop {
         // 2. Code predictor: reads from talker.normed_buf (post-norm hidden) + semantic_embed_buf
         //    Uses normed_ptr (after final RMSNorm) to match Burn's generate_step_with_embed
         //    which returns hidden AFTER norm.forward().
-        hip_cp.generate_gpu_to_gpu(self.stream, hip_talker.normed_ptr(), self.semantic_embed_buf);
+        hip_cp.generate_gpu_to_gpu(
+            self.stream,
+            hip_talker.normed_ptr(),
+            self.semantic_embed_buf,
+        );
 
         // 3. Embed+fuse: semantic_embed_buf += acoustic_embed_sum + text
         self.launch_add_inplace(

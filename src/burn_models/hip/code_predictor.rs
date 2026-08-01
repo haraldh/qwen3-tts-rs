@@ -319,12 +319,11 @@ impl HipCodePredictor {
                 let scales_key = format!("{prefix}.{suffix}_scales");
                 let zeros_key = format!("{prefix}.{suffix}_zeros");
                 if int4_file.has_key(&int4_key) {
-                    let packed_bytes =
-                        int4_file.raw_bytes(&int4_key).map_err(|e| e.to_string())?;
-                    let scale_bytes =
-                        int4_file.raw_bytes(&scales_key).map_err(|e| e.to_string())?;
-                    let zeros_bytes =
-                        int4_file.raw_bytes(&zeros_key).map_err(|e| e.to_string())?;
+                    let packed_bytes = int4_file.raw_bytes(&int4_key).map_err(|e| e.to_string())?;
+                    let scale_bytes = int4_file
+                        .raw_bytes(&scales_key)
+                        .map_err(|e| e.to_string())?;
+                    let zeros_bytes = int4_file.raw_bytes(&zeros_key).map_err(|e| e.to_string())?;
                     if let WeightPtr::Bf16(old) = *weight_ptr {
                         unsafe { cubecl_hip_sys::hipFree(old) };
                     }
@@ -592,19 +591,13 @@ impl HipCodePredictor {
                     ptr_of(&mut k_i32),
                     ptr_of(&mut n_i32),
                 ];
-                self.launch_kernel(
-                    self.kernels.gemv,
-                    n as u32,
-                    1,
-                    1,
-                    256,
-                    1,
-                    1,
-                    0,
-                    &mut args,
-                );
+                self.launch_kernel(self.kernels.gemv, n as u32, 1, 1, 256, 1, 1, 0, &mut args);
             }
-            WeightPtr::Int4 { packed, scales, zeros } => {
+            WeightPtr::Int4 {
+                packed,
+                scales,
+                zeros,
+            } => {
                 let mut p_input = input;
                 let mut p_packed = packed;
                 let mut p_output = output;
@@ -1151,7 +1144,11 @@ impl GpuAlloc {
         let packed = self.upload_raw(packed_bytes);
         let scales = self.upload_raw(scale_bytes);
         let zeros = self.upload_raw(zeros_bytes);
-        WeightPtr::Int4 { packed, scales, zeros }
+        WeightPtr::Int4 {
+            packed,
+            scales,
+            zeros,
+        }
     }
 
     pub(crate) fn alloc(&mut self, size: usize) -> *mut c_void {
