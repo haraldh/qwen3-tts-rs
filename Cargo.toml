@@ -31,7 +31,7 @@ profiling = ["dep:tracing-chrome"]
 
 [dependencies]
 # Burn ML framework (replaces Candle)
-burn = { path = "/home/harald/git/qwen3-tts-rs/burn/crates/burn", default-features = false }
+burn = { path = "burn/crates/burn", default-features = false }
 half = "2.7"
 safetensors = "0.4"
 
@@ -125,20 +125,20 @@ lto = false
 
 # Override cubecl crates to use local builds (must match burn's local cubecl)
 [patch.crates-io]
-cubecl = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl" }
-cubecl-common = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-common" }
-cubecl-core = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-core" }
-cubecl-cpp = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-cpp" }
-cubecl-cpu = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-cpu" }
-cubecl-cuda = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-cuda" }
-cubecl-hip = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-hip" }
-cubecl-ir = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-ir" }
-cubecl-macros = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-macros" }
-cubecl-macros-internal = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-macros-internal" }
-cubecl-opt = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-opt" }
-cubecl-runtime = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-runtime" }
-cubecl-spirv = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-spirv" }
-cubecl-std = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-std" }
-cubecl-wgpu = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-wgpu" }
-cubecl-zspace = { path = "/home/harald/git/qwen3-tts-rs/cubecl/crates/cubecl-zspace" }
-cubecl-hip-sys = { path = "/home/harald/git/qwen3-tts-rs/cubecl-hip-sys/crates/cubecl-hip-sys" }
+cubecl = { path = "cubecl/crates/cubecl" }
+cubecl-common = { path = "cubecl/crates/cubecl-common" }
+cubecl-core = { path = "cubecl/crates/cubecl-core" }
+cubecl-cpp = { path = "cubecl/crates/cubecl-cpp" }
+cubecl-cpu = { path = "cubecl/crates/cubecl-cpu" }
+cubecl-cuda = { path = "cubecl/crates/cubecl-cuda" }
+cubecl-hip = { path = "cubecl/crates/cubecl-hip" }
+cubecl-ir = { path = "cubecl/crates/cubecl-ir" }
+cubecl-macros = { path = "cubecl/crates/cubecl-macros" }
+cubecl-macros-internal = { path = "cubecl/crates/cubecl-macros-internal" }
+cubecl-opt = { path = "cubecl/crates/cubecl-opt" }
+cubecl-runtime = { path = "cubecl/crates/cubecl-runtime" }
+cubecl-spirv = { path = "cubecl/crates/cubecl-spirv" }
+cubecl-std = { path = "cubecl/crates/cubecl-std" }
+cubecl-wgpu = { path = "cubecl/crates/cubecl-wgpu" }
+cubecl-zspace = { path = "cubecl/crates/cubecl-zspace" }
+cubecl-hip-sys = { path = "cubecl-hip-sys/crates/cubecl-hip-sys" }
