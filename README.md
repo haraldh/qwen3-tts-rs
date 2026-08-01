@@ -73,6 +73,21 @@ request after boot is dramatically slower than the rest. Warm it up before servi
 **Quality check**: transcribing the output with whisper large-v3 returns the input sentence
 verbatim — 100% word overlap (`scripts/verify_audio.py`, see [CLAUDE.md](CLAUDE.md)).
 
+**The decoder loses 2880 samples off the tail** of every decode on ROCm — a constant, not a
+proportion, and always at the end (`examples/decode_align_probe.rs` measures both facts). The
+50 ms of silence appended to a finished utterance covers it. NdArray does not do this, so it
+is a backend bug rather than the architecture; worth revisiting if the last 120 ms of an
+utterance ever matters.
+
+**Streaming replays decoder context.** The decoder is causal but not stateless — an 8-layer
+transformer runs over the code sequence before the conv stack — so `--streaming` decodes each
+chunk with the preceding 64 frames prepended and discards their samples. Without that,
+chunks drift apart and long utterances come out audibly scrambled. Streamed output is
+sample-count identical to buffered and tracks it to about 21 dB; the residual is attention
+reaching back further than the replayed window. The reference decoder config caps that with a
+`sliding_window` of 72, which this implementation does not yet apply — doing so would make
+chunked decoding exact.
+
 ## Changelog
 
 ### 0.4.0

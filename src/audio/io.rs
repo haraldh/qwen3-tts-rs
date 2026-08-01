@@ -281,6 +281,24 @@ mod tests {
         assert!(AudioBuffer::from_wav_bytes(b"definitely not a wav file").is_err());
     }
 
+    /// The streaming header must describe the same format as a buffered
+    /// response, differing only in the two length fields it cannot know yet.
+    #[test]
+    fn test_wav_stream_header_matches_buffered_header() {
+        let header = AudioBuffer::wav_stream_header(24000);
+        let buffered = AudioBuffer::new(vec![0.0; 480], 24000).to_wav_bytes();
+
+        assert_eq!(header.len(), 44);
+        for (i, (&a, &b)) in header.iter().zip(&buffered).enumerate() {
+            // 4..8 is the RIFF size, 40..44 the data size.
+            if (4..8).contains(&i) || (40..44).contains(&i) {
+                assert_eq!(a, 0xFF, "byte {i} should be an unknown-length marker");
+            } else {
+                assert_eq!(a, b, "byte {i} differs from a buffered WAV header");
+            }
+        }
+    }
+
     #[test]
     fn test_audio_buffer_duration() {
         let buffer = AudioBuffer::new(vec![0.0; 24000], 24000);
