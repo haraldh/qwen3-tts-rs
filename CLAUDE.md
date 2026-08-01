@@ -2,6 +2,39 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## What this fork is
+
+A Strix Halo / ROCm fork of [TrevorS/qwen3-tts-rs](https://github.com/TrevorS/qwen3-tts-rs),
+tuned for one specific machine: **AMD Ryzen AI MAX+ 395 w/ Radeon 8060S (gfx1151)**,
+ROCm 7.2.53210, NixOS. Upstream targets CUDA via candle; this fork targets RDNA 3.5
+via Burn, and getting BF16 to work there required patching the GPU stack itself.
+
+The patched toolchain lives in submodules, each a fork on branch `qwen3-tts-rs`:
+
+| Submodule | Fork of | Carries |
+|-----------|---------|---------|
+| `burn/` | `tracel-ai/burn` | RMSNorm computed in F32 for BF16/F16 stability |
+| `cubecl/` | `tracel-ai/cubecl` | HIP 7.2 BF16 WMMA type fixes, `max_bfloat16`/`min_bfloat16`, comparison-operator promotion, sub-int narrowing |
+| `cubek/` | `tracel-ai/cubek` | BF16 attention/reduce fixes: F32 SoftmaxLhs, argmax/argmin OOB clamping, reduce bound checks, MMA stage-cast disable |
+| `cubecl-hip-sys/` | `tracel-ai/cubecl-hip-sys` | HIP 7.2 bindings |
+
+`git clone --recurse-submodules` is required — the build will not resolve without them.
+All `[patch.crates-io]` paths are relative, so the checkout works at any location.
+
+Two consequences for anyone working here:
+
+- **Don't bump the submodules to upstream** expecting things to still work. The BF16
+  path depends on those patches. `cubek`'s causal mask is top-left aligned, which
+  breaks prefill continuation at offset > 0 — `transformer.rs` works around it.
+- **CPU-load components that hit BF16 autotune with new shapes.** Autotune crashes on
+  gfx1151 for unseen shapes; the speaker and speech encoders run on CPU NdArray for
+  this reason, not for precision.
+
+Hot paths bypass CubeCL entirely: `src/burn_models/hip/` is ~3k lines of raw HIP
+(code predictor, talker decode, frame loop, kernels) driven through HIPRTC. That is
+where the real-time factor comes from, so changes there need benchmarking, not just
+tests (`git log --grep=perf:` traces how it got there).
+
 ## Build & Test
 
 ```bash

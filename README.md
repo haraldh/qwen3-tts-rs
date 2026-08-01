@@ -1,8 +1,58 @@
-# qwen3-tts
+# qwen3-tts — Strix Halo / ROCm fork
 
-Pure Rust inference for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), a text-to-speech model from Alibaba. Built on [candle](https://github.com/huggingface/candle) — no Python or ONNX runtime required.
+Pure Rust inference for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), a text-to-speech model from Alibaba. No Python or ONNX runtime required.
+
+> **This is a hardware-specific fork of [TrevorS/qwen3-tts-rs](https://github.com/TrevorS/qwen3-tts-rs).**
+> It targets one machine — AMD Ryzen AI MAX+ 395 w/ Radeon 8060S (gfx1151, RDNA 3.5) on ROCm 7.2 — and
+> replaces upstream's candle/CUDA stack with [Burn](https://burn.dev) plus hand-written HIP kernels.
+> Making BF16 work on this GPU required patching Burn, CubeCL and cubek themselves, so those are
+> vendored as submodules pointing at patched forks. **Upstream is the better starting point for CUDA,
+> Metal, or CPU users.**
 
 All code in this repo was written with [Claude Code](https://claude.ai/code). This is an experiment -- not a production library.
+
+## What's different in this fork
+
+**Model stack.** Upstream runs on candle. Here the active stack is `src/burn_models/` on
+[Burn](https://burn.dev), which is multi-backend (ROCm/HIP, CUDA, WGPU/Vulkan, CPU). The candle code
+survives in `src/models/` behind the `_candle_legacy` feature as a migration reference.
+
+**Patched GPU toolchain.** BF16 on gfx1151 hit bugs at every layer, so the fixes live in forks
+vendored as submodules on branch `qwen3-tts-rs`:
+
+| Submodule | Fork of | Carries |
+|-----------|---------|---------|
+| `burn/` | `tracel-ai/burn` | RMSNorm in F32 for BF16/F16 numerical stability |
+| `cubecl/` | `tracel-ai/cubecl` | HIP 7.2 BF16 WMMA type fixes, `max_bfloat16`/`min_bfloat16`, comparison-operator promotion, sub-int narrowing |
+| `cubek/` | `tracel-ai/cubek` | F32 SoftmaxLhs for BF16 attention, argmax/argmin OOB clamping, reduce bound checks |
+| `cubecl-hip-sys/` | `tracel-ai/cubecl-hip-sys` | HIP 7.2 bindings |
+
+**Raw HIP hot paths.** The code predictor and talker decode step bypass CubeCL entirely —
+`src/burn_models/hip/` is ~3k lines of HIP compiled through HIPRTC. It includes a flat-parallel
+decode-attention kernel (`attention_decode_long_bf16`) where each thread computes full dot products
+for its own KV positions, dropping the ~7 barrier syncs per KV position that the cooperative
+reduction needed — worth tens of thousands of syncs at seq_kv 2048+. This is what
+took the 0.6B CustomVoice model from RTF ~1.84 to roughly **0.5 (about 2× real-time)** on the 8060S.
+
+**Also added:** an OpenAI-compatible HTTP server (`serve` feature, `POST /v1/audio/speech`),
+int4 weight quantization via asymmetric HQQ, and ECAPA-TDNN speaker-encoder voice cloning for
+Base models.
+
+### Building this fork
+
+```bash
+git clone --recurse-submodules -b strix-halo https://github.com/haraldh/qwen3-tts-rs.git
+cd qwen3-tts-rs
+cargo build --release --features rocm,serve
+```
+
+The submodules are mandatory — `[patch.crates-io]` points at them by relative path, so the build
+cannot resolve without them. Cloning without `--recurse-submodules` fails at dependency resolution.
+
+> **Note on the sections below.** Everything from *Performance* onward is inherited from upstream and
+> describes the candle/CUDA build: the benchmark table is from an NVIDIA DGX Spark, and the feature
+> table lists `flash-attn`, `metal`, `mkl` and `accelerate`, none of which exist in this fork's
+> `Cargo.toml`. See [CLAUDE.md](CLAUDE.md) for the feature flags that actually exist.
 
 ## Changelog
 
