@@ -32,7 +32,7 @@ vendored as submodules on branch `qwen3-tts-rs`:
 decode-attention kernel (`attention_decode_long_bf16`) where each thread computes full dot products
 for its own KV positions, dropping the ~7 barrier syncs per KV position that the cooperative
 reduction needed — worth tens of thousands of syncs at seq_kv 2048+. This is what
-took the 0.6B CustomVoice model from RTF ~1.84 to roughly **0.5 (about 2× real-time)** on the 8060S.
+took the 0.6B CustomVoice model from RTF ~1.84 to **0.29** on the 8060S (see below).
 
 **Also added:** an OpenAI-compatible HTTP server (`serve` feature, `POST /v1/audio/speech`),
 int4 weight quantization via asymmetric HQQ, and ECAPA-TDNN speaker-encoder voice cloning for
@@ -48,6 +48,30 @@ cargo build --release --features rocm,serve
 
 The submodules are mandatory — `[patch.crates-io]` points at them by relative path, so the build
 cannot resolve without them. Cloning without `--recurse-submodules` fails at dependency resolution.
+
+### Measured on this hardware
+
+0.6B-CustomVoice, speaker Ryan, seed 42, 79 characters of English text producing 5.85 s of
+24 kHz mono audio. Measured 2026-08-01 on the Radeon 8060S:
+
+| Run | Wall time | RTF |
+|-----|-----------|-----|
+| Cold (first process, includes autotune) | 25.28 s | 4.32 |
+| Warm | 1.70 s | **0.29** |
+| Warm (repeat) | 1.69 s | **0.29** |
+
+RTF = wall-clock ÷ audio duration; lower is better, < 1.0 is faster than real-time. So steady
+state is roughly **3.4× real-time**.
+
+**Cold start costs ~23 seconds.** The first synthesis in a fresh process spends that time in
+CubeCL autotune, benchmarking BF16 convolution and matmul variants for the decoder's shapes.
+The results cache, so every later run is ~15× faster — but it means the HTTP server's first
+request after boot is dramatically slower than the rest. Warm it up before serving traffic.
+
+**Output is deterministic**: identical MD5 across runs at the same seed.
+
+**Quality check**: transcribing the output with whisper large-v3 returns the input sentence
+verbatim — 100% word overlap (`scripts/verify_audio.py`, see [CLAUDE.md](CLAUDE.md)).
 
 > **Note on the sections below.** Everything from *Performance* onward is inherited from upstream and
 > describes the candle/CUDA build: the benchmark table is from an NVIDIA DGX Spark, and the feature

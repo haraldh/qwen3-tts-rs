@@ -64,6 +64,45 @@ Pre-commit (runs both Rust and Python checks):
 make pre-commit
 ```
 
+## End-to-end verification
+
+Unit tests use synthetic tensors and never touch the GPU, so they cannot tell you
+whether a kernel change still produces intelligible speech. Any change under
+`burn_models/` — especially `hip/` — needs this loop:
+
+```bash
+# 1. Build (submodules must be checked out)
+cargo build --release --features rocm,serve
+
+# 2. Synthesize. Write to /var/tmp — /tmp is tmpfs (RAM) on this machine.
+mkdir -p /var/tmp/qwen3-tts-test
+TEXT="The sun set behind the mountains, painting the sky in shades of gold and violet."
+./target/release/generate_audio \
+  --model-dir test_data/models/0.6B-CustomVoice \
+  --text "$TEXT" --speaker ryan --language english --seed 42 \
+  --output /var/tmp/qwen3-tts-test/out.wav
+
+# 3. Check it is actually speech, not plausible-looking noise
+python3 scripts/verify_audio.py /var/tmp/qwen3-tts-test/out.wav "$TEXT"
+```
+
+`verify_audio.py` transcribes through whisper.cpp's OpenAI-compatible server at
+`http://halo:8771/v1/audio/transcriptions` (large-v3, Vulkan on the iGPU) and compares
+word overlap against the input, exiting non-zero below 0.7. Override the endpoint with
+`--url` or `WHISPER_URL`. A healthy 0.6B-CustomVoice run scores 100%.
+
+Three things to know when reading the numbers:
+
+- **Ignore the first run's RTF.** A cold process spends ~23 s in CubeCL autotune
+  (`Tuning ConvAutotuneKey` / `MatmulAutotuneKey` lines) for the BF16 decoder
+  convolutions. Measured cold RTF 4.32 vs **0.29 warm** — a ~15× difference on the
+  same binary. Always take the second or third run, or use `e2e_bench --warmup`.
+- **Same seed must give the same bytes.** `md5sum` across runs at `--seed 42` is a
+  cheap regression check; a kernel that changes output nondeterministically is a bug.
+- **Overlap can pass while quality regresses.** STT is tolerant — it will happily
+  transcribe robotic or clipped audio. For anything touching the decoder, listen to
+  the WAV or compare against `assets/audio/` rather than trusting the percentage.
+
 ## Profiling & Benchmarks
 
 Model weights required:
@@ -170,4 +209,4 @@ Generation uses codec vocabulary (0–3071), not text vocabulary:
 - GPU sync points: `tracing::trace!(target: "gpu_sync", ...)` markers
 - Decoder and speaker encoder always run in F32 regardless of backend compute dtype
 - Tests don't require model weights — use synthetic tensors
-- Local path dependencies: `burn` and `cubecl` are patched to local builds (see `[patch.crates-io]` in Cargo.toml)
+- Local path dependencies: `burn`, `cubecl`, `cubek` and `cubecl-hip-sys` are git submodules patched in by relative path (see `[patch.crates-io]` in Cargo.toml)
