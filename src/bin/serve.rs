@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -106,6 +106,11 @@ struct Args {
     /// but stops the first real request from paying CubeCL autotune.
     #[arg(long)]
     no_warmup: bool,
+
+    /// Maximum request body size in MiB. Cloning requests carry a base64 WAV,
+    /// so they far exceed axum's 2 MiB default.
+    #[arg(long, default_value_t = 64)]
+    max_body_mb: usize,
 }
 
 // ── Audio format ─────────────────────────────────────────────────────────
@@ -632,6 +637,12 @@ fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
         .route("/v1/audio/speech", post(speech_handler))
+        // axum defaults to a 2 MB body, which a cloning request blows past:
+        // ref_audio is a base64 WAV, so a ~20 s 24 kHz reference is already
+        // ~1.3 MB before encoding and ~1.8 MB after. Exceeding it yields a
+        // bare 413 "failed to buffer the request body" from the extractor,
+        // with nothing to say the limit was the problem.
+        .layer(DefaultBodyLimit::max(args.max_body_mb * 1024 * 1024))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state);
 
