@@ -800,23 +800,23 @@ impl<B: Backend> Qwen3TTS<B> {
         #[cfg(feature = "profiling")]
         let _decode_span = tracing::info_span!("decode").entered();
 
-        // Workaround: ROCm ConvTranspose1d produces shorter output than expected
-        // for very short sequences (in_len=1 with stride=2 gives out_len=2 instead
-        // of 4), causing CausalTransConv1d trimming to underflow.  Pad to 2 frames
-        // minimum and trim the extra audio afterward.
-        let padded_codes;
-        let (decoded_codes, padded) = if codes.len() < 2 {
-            let mut p = codes.to_vec();
-            while p.len() < 2 {
-                p.push(p.last().unwrap().clone());
-            }
-            padded_codes = p;
-            (&padded_codes[..], true)
-        } else {
-            (codes, false)
-        };
+        // Workaround: ROCm ConvTranspose1d returns a constant 2880 samples fewer
+        // than `frames * SAMPLES_PER_FRAME`, all of it at the tail, so the last
+        // 120ms of every utterance would be lost — audible as the closing syllable
+        // being cut short. Decoding two extra copies of the final frame pushes the
+        // deficit past the audio we keep. The decoder is causal (pinned by
+        // `test_decode_is_causal_in_frames`), so the retained samples are identical
+        // to what an unpadded decode would have produced.
+        //
+        // The padding doubles as the old short-sequence workaround: a lone frame
+        // used to make CausalTransConv1d's trim underflow, and it can no longer
+        // reach the decoder alone.
+        let mut decoded_codes = codes.to_vec();
+        let last = codes[codes.len() - 1].clone();
+        decoded_codes.push(last.clone());
+        decoded_codes.push(last);
 
-        let waveform = self.decoder.decode(self.codes_to_tensor(decoded_codes)); // [1, 1, samples]
+        let waveform = self.decoder.decode(self.codes_to_tensor(&decoded_codes)); // [1, 1, samples]
         let total_samples = waveform.dims()[2];
         let mut samples: Vec<f32> = waveform
             .reshape([total_samples])
@@ -825,10 +825,8 @@ impl<B: Backend> Qwen3TTS<B> {
             .to_vec()
             .unwrap();
 
-        if padded {
-            let keep = total_samples * codes.len() / decoded_codes.len();
-            samples.truncate(keep);
-        }
+        // Exactly one frame of audio per input frame, on every backend.
+        samples.truncate(codes.len() * SAMPLES_PER_FRAME);
         Ok(samples)
     }
 
