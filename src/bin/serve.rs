@@ -240,6 +240,21 @@ fn resolve_voice(name: &str) -> Result<Speaker, String> {
         .map_err(|_| format!("Unknown voice '{name}'. Available: ryan, serena, vivian, aiden, eric, dylan, uncle_fu, ono_anna, sohee, alloy, nova, echo, fable, onyx, shimmer"))
 }
 
+/// Treat a blank reference transcript as no transcript at all.
+///
+/// Clients routinely send `""` to mean "no value", and JSON has no way to
+/// distinguish that intent from a real transcript. Taken literally it selects
+/// ICL mode with a zero-token transcript, which is worse than either mode:
+/// `build_icl_prompt` concatenates `ref_text + target_text`, so with the
+/// reference half empty the *target* text is overlaid onto the opening frames
+/// of the reference's own codec codes, and the model is told the new sentence
+/// transcribes the start of the reference recording. It also pays the full
+/// speech-encoder cost to get there. Falling back to speaker-embedding-only
+/// cloning is what the caller meant.
+fn normalize_ref_text(ref_text: Option<&str>) -> Option<&str> {
+    ref_text.map(str::trim).filter(|s| !s.is_empty())
+}
+
 /// Decode a base64 WAV from a request into reference audio.
 ///
 /// Accepts a bare base64 payload or a `data:audio/wav;base64,...` URI, since
@@ -390,10 +405,12 @@ async fn speech_handler(State(state): State<AppState>, Json(req): Json<SpeechReq
 
     // Resolve a per-request reference voice, if the caller sent one
     let ref_voice = match req.ref_audio.as_deref() {
-        Some(encoded) => match decode_ref_audio(encoded, req.ref_text.as_deref()) {
-            Ok(v) => Some(v),
-            Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
-        },
+        Some(encoded) => {
+            match decode_ref_audio(encoded, normalize_ref_text(req.ref_text.as_deref())) {
+                Ok(v) => Some(v),
+                Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
+            }
+        }
         None => None,
     };
 
@@ -628,7 +645,8 @@ fn main() -> Result<()> {
     let voice_clone_prompt = if let Some(ref ref_audio_path) = args.ref_audio {
         eprintln!("Loading reference audio from {ref_audio_path}...");
         let ref_audio = qwen3_tts::AudioBuffer::load(ref_audio_path)?;
-        let prompt = model.create_voice_clone_prompt(&ref_audio, args.ref_text.as_deref())?;
+        let prompt = model
+            .create_voice_clone_prompt(&ref_audio, normalize_ref_text(args.ref_text.as_deref()))?;
         eprintln!(
             "Voice clone prompt ready (ICL={})",
             prompt.ref_codes.is_some()
