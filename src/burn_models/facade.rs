@@ -688,17 +688,23 @@ impl<B: Backend> Qwen3TTS<B> {
             &tts_pad_embed,
         );
 
-        // ICL decode: prepend ref_codes and trim proportionally
+        // ICL decode: the generated frames continue the reference, so they are
+        // decoded with the reference codes in front of them for left context and
+        // that leading region is then dropped.
         if let Some(ref ref_codes) = prompt.ref_codes {
             let ref_len = ref_codes.len();
             let mut combined = ref_codes.clone();
             combined.extend(all_codes.iter().cloned());
 
-            let mut audio = self.decode_codes(&combined)?;
-            let total_frames = combined.len();
-            let cut_samples = ref_len * audio.len() / total_frames.max(1);
-            audio.samples = audio.samples[cut_samples.min(audio.len())..].to_vec();
-            Ok(audio)
+            let mut samples = self.decode_samples(&combined)?;
+            // Cut at the reference's exact sample position. Scaling the cut by
+            // frame ratio instead would divide a length that is short by the
+            // decoder's constant tail deficit, leaving a slice of reference
+            // audio at the head of the utterance.
+            let cut = (ref_len * SAMPLES_PER_FRAME).min(samples.len());
+            samples.drain(..cut);
+            samples.extend(std::iter::repeat_n(0.0f32, TAIL_PAD_SAMPLES));
+            Ok(AudioBuffer::new(samples, 24000))
         } else {
             self.decode_codes(&all_codes)
         }
@@ -1412,6 +1418,21 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
                 (trailing, trailing_len, tts_pad, logits)
             };
 
+        // Seed the decoder context with the tail of the reference. In ICL mode the
+        // generated frames continue the reference mid-utterance, so decoding the
+        // first chunk from an empty context starts the decoder cold exactly where
+        // the audio is least forgiving. Marking those frames as already emitted
+        // keeps the reference itself out of the output.
+        let (decode_context, emitted_samples) = match &prompt.ref_codes {
+            Some(ref_codes) if is_icl => {
+                let start = ref_codes.len().saturating_sub(DECODE_CONTEXT_FRAMES);
+                let ctx = ref_codes[start..].to_vec();
+                let emitted = ctx.len() * SAMPLES_PER_FRAME;
+                (ctx, emitted)
+            }
+            _ => (Vec::new(), 0),
+        };
+
         // Transfer prefill KV data to HIP talker
         #[cfg(feature = "rocm")]
         model.load_hip_talker_cache(&kv_caches);
@@ -1477,9 +1498,9 @@ impl<'a, B: Backend> StreamingSession<'a, B> {
             current_token: if done { None } else { Some(first_token) },
             frames_generated: 0,
             frame_buffer: Vec::new(),
-            decode_context: Vec::new(),
+            decode_context,
             context_start_frame: 0,
-            emitted_samples: 0,
+            emitted_samples,
             chunk_frames: options.chunk_frames,
             done,
             trailing_text_hidden,
